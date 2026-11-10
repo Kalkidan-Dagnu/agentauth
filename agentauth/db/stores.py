@@ -26,8 +26,11 @@ from agentauth.core.models import (
     Permission,
     PermissionDecision,
     Policy,
+    Webhook,
+    WebhookDelivery,
+    WebhookEvent,
 )
-from agentauth.db.models import AgentRow, AuditLogRow, PolicyRow
+from agentauth.db.models import AgentRow, AuditLogRow, PolicyRow, WebhookDeliveryRow, WebhookRow
 
 logger = structlog.get_logger(__name__)
 
@@ -312,3 +315,171 @@ class DBAuditLogStore:
 agent_store = DBAgentStore()
 policy_store = DBPolicyStore()
 audit_log_store = DBAuditLogStore()
+
+
+# ── DB-backed WebhookStore ─────────────────────────────────────────────────────
+
+
+def _row_to_webhook(row: WebhookRow) -> Webhook:
+    """Convert an ORM WebhookRow to a Pydantic Webhook."""
+    return Webhook(
+        id=UUID(row.id),
+        agent_id=UUID(row.agent_id),
+        url=row.url,
+        events=[WebhookEvent(e) for e in row.events],
+        secret=row.secret,
+        is_active=row.is_active,
+        created_at=row.created_at,
+    )
+
+
+def _row_to_delivery(row: WebhookDeliveryRow) -> WebhookDelivery:
+    """Convert an ORM WebhookDeliveryRow to a Pydantic WebhookDelivery."""
+    return WebhookDelivery(
+        id=UUID(row.id),
+        webhook_id=UUID(row.webhook_id),
+        request_id=UUID(row.request_id),
+        attempt=row.attempt,
+        success=row.success,
+        http_status=row.http_status,
+        response_body=row.response_body,
+        error_message=row.error_message,
+        delivered_at=row.delivered_at,
+    )
+
+
+class DBWebhookStore:
+    """
+    Async database-backed webhook store.
+
+    Handles webhook registration CRUD and delivery log persistence.
+    """
+
+    # ── Webhook CRUD ───────────────────────────────────────────────────────────
+
+    async def create(self, db: AsyncSession, webhook: Webhook) -> Webhook:
+        """Persist a new webhook registration."""
+        row = WebhookRow(
+            id=str(webhook.id),
+            agent_id=str(webhook.agent_id),
+            url=webhook.url,
+            events=[e.value for e in webhook.events],
+            secret=webhook.secret,
+            is_active=webhook.is_active,
+            created_at=webhook.created_at,
+        )
+        db.add(row)
+        await db.flush()
+        logger.info(
+            "Webhook registered",
+            webhook_id=str(webhook.id),
+            agent_id=str(webhook.agent_id),
+            url=webhook.url,
+            events=[e.value for e in webhook.events],
+        )
+        return webhook
+
+    async def get(self, db: AsyncSession, webhook_id: UUID) -> Webhook | None:
+        """Fetch a webhook by ID, or None if not found."""
+        result = await db.execute(
+            select(WebhookRow).where(WebhookRow.id == str(webhook_id))
+        )
+        row = result.scalar_one_or_none()
+        return _row_to_webhook(row) if row else None
+
+    async def list_for_agent(
+        self, db: AsyncSession, agent_id: UUID, active_only: bool = False
+    ) -> list[Webhook]:
+        """Return all webhooks for an agent, optionally filtering to active only."""
+        stmt = select(WebhookRow).where(WebhookRow.agent_id == str(agent_id))
+        if active_only:
+            stmt = stmt.where(WebhookRow.is_active == True)  # noqa: E712
+        stmt = stmt.order_by(WebhookRow.created_at.asc())
+        result = await db.execute(stmt)
+        return [_row_to_webhook(row) for row in result.scalars().all()]
+
+    async def deactivate(self, db: AsyncSession, webhook_id: UUID) -> bool:
+        """
+        Soft-delete a webhook by marking it inactive.
+        Returns True if found, False otherwise.
+        """
+        result = await db.execute(
+            update(WebhookRow)
+            .where(WebhookRow.id == str(webhook_id))
+            .values(is_active=False)
+        )
+        deleted = result.rowcount > 0
+        if deleted:
+            logger.info("Webhook deactivated", webhook_id=str(webhook_id))
+        return deleted
+
+    async def hard_delete(self, db: AsyncSession, webhook_id: UUID) -> bool:
+        """
+        Permanently delete a webhook and its delivery history.
+        Returns True if deleted, False if not found.
+        """
+        result = await db.execute(
+            delete(WebhookRow).where(WebhookRow.id == str(webhook_id))
+        )
+        deleted = result.rowcount > 0
+        if deleted:
+            logger.info("Webhook deleted", webhook_id=str(webhook_id))
+        return deleted
+
+    # ── Delivery log ───────────────────────────────────────────────────────────
+
+    async def record_delivery(
+        self, db: AsyncSession, delivery: WebhookDelivery
+    ) -> None:
+        """Persist a delivery attempt to the log."""
+        row = WebhookDeliveryRow(
+            id=str(delivery.id),
+            webhook_id=str(delivery.webhook_id),
+            request_id=str(delivery.request_id),
+            attempt=delivery.attempt,
+            success=delivery.success,
+            http_status=delivery.http_status,
+            response_body=delivery.response_body,
+            error_message=delivery.error_message,
+            delivered_at=delivery.delivered_at,
+        )
+        db.add(row)
+        await db.flush()
+        logger.debug(
+            "Webhook delivery recorded",
+            webhook_id=str(delivery.webhook_id),
+            request_id=str(delivery.request_id),
+            attempt=delivery.attempt,
+            success=delivery.success,
+        )
+
+    async def list_deliveries(
+        self,
+        db: AsyncSession,
+        webhook_id: UUID,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[WebhookDelivery]:
+        """Return delivery history for a webhook, most recent first."""
+        result = await db.execute(
+            select(WebhookDeliveryRow)
+            .where(WebhookDeliveryRow.webhook_id == str(webhook_id))
+            .order_by(WebhookDeliveryRow.delivered_at.desc())
+            .limit(limit)
+            .offset(offset)
+        )
+        return [_row_to_delivery(row) for row in result.scalars().all()]
+
+    async def count_deliveries(self, db: AsyncSession, webhook_id: UUID) -> int:
+        """Return total number of delivery attempts for a webhook."""
+        from sqlalchemy import func
+        result = await db.execute(
+            select(func.count()).where(
+                WebhookDeliveryRow.webhook_id == str(webhook_id)
+            )
+        )
+        return result.scalar_one()
+
+
+# Add singleton to module exports
+webhook_store = DBWebhookStore()

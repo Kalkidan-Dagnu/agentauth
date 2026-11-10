@@ -138,3 +138,83 @@ class PermissionDecision(BaseModel):
     latency_ms: float = Field(default=0.0)
 
     model_config = {"json_encoders": {UUID: str, datetime: lambda v: v.isoformat()}}
+
+
+# ── Webhook models ─────────────────────────────────────────────────────────────
+
+
+class WebhookEvent(str, Enum):
+    """
+    Decision result values that a webhook can subscribe to.
+    Maps directly to DecisionResult — kept separate so the API
+    surface is explicit about what can be subscribed to.
+    """
+    ALLOW = "ALLOW"
+    DENY = "DENY"
+    ESCALATE = "ESCALATE"
+
+
+class Webhook(BaseModel):
+    """
+    A webhook endpoint registered to an agent.
+
+    When a PermissionDecision is produced whose result is in ``events``,
+    AgentAuth will POST the decision payload to ``url``.
+
+    ``events`` defaults to [ESCALATE] — the most common case.
+    Set to all three values to receive every decision.
+
+    ``secret`` is an optional shared secret. When set, every delivery
+    includes an X-AgentAuth-Signature header (HMAC-SHA256 of the payload)
+    so the receiver can verify authenticity.
+    """
+    id: UUID = Field(default_factory=uuid4)
+    agent_id: UUID
+    url: str = Field(..., description="HTTPS endpoint to deliver payloads to")
+    events: list[WebhookEvent] = Field(
+        default_factory=lambda: [WebhookEvent.ESCALATE],
+        description="Decision result types to deliver. Defaults to [ESCALATE].",
+    )
+    secret: str | None = Field(
+        default=None,
+        description="Optional HMAC secret for payload signature verification",
+    )
+    is_active: bool = Field(default=True)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+    model_config = {"json_encoders": {UUID: str, datetime: lambda v: v.isoformat()}}
+
+
+class WebhookDelivery(BaseModel):
+    """
+    A single HTTP delivery attempt for a webhook.
+
+    One row per attempt — retries produce additional rows — so the
+    full retry history is queryable via GET /webhooks/{id}/deliveries.
+    """
+    id: UUID = Field(default_factory=uuid4)
+    webhook_id: UUID
+    request_id: UUID = Field(description="The PermissionDecision request_id this delivery is for")
+    attempt: int = Field(default=1, ge=1, description="Attempt number (1 = first try)")
+    success: bool = Field(default=False)
+    http_status: int | None = Field(default=None, description="HTTP response status code")
+    response_body: str | None = Field(default=None, description="First 1 KB of response body")
+    error_message: str | None = Field(default=None, description="Network/timeout error if any")
+    delivered_at: datetime = Field(default_factory=datetime.utcnow)
+
+    model_config = {"json_encoders": {UUID: str, datetime: lambda v: v.isoformat()}}
+
+
+class WebhookPayload(BaseModel):
+    """
+    The JSON body POSTed to a registered webhook URL.
+
+    Receivers should verify the X-AgentAuth-Signature header when a
+    secret is configured (HMAC-SHA256 hex digest of the raw request body).
+    """
+    event: WebhookEvent
+    agent_id: UUID
+    decision: PermissionDecision
+    delivered_at: datetime = Field(default_factory=datetime.utcnow)
+
+    model_config = {"json_encoders": {UUID: str, datetime: lambda v: v.isoformat()}}

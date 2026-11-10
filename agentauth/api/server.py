@@ -1,12 +1,12 @@
 """
-AgentAuth REST API Server — v0.2.0
+AgentAuth REST API Server — v0.3.0
 
-Changes from v0.1.0:
-  - All agent/policy state is now persisted to PostgreSQL via SQLAlchemy.
-  - POST /agents/{id}/token  — issue a signed JWT for an agent.
-  - Evaluate endpoint verifies JWT when a Bearer token is supplied.
-  - Every PermissionDecision is written to the audit_log table.
-  - GET  /agents/{id}/audit  — query decision history for an agent.
+Changes from v0.2.0:
+  - POST /agents/{id}/webhooks   — register a webhook URL for an agent
+  - GET  /agents/{id}/webhooks   — list webhooks for an agent
+  - DELETE /webhooks/{id}        — remove a webhook
+  - GET  /webhooks/{id}/deliveries — inspect delivery history
+  - After every /evaluate, matching webhooks are fired as a BackgroundTask
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from typing import Any
 from uuid import UUID
 
 import structlog
-from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -31,9 +31,13 @@ from agentauth.core.models import (
     Permission,
     PermissionDecision,
     Policy,
+    Webhook,
+    WebhookDelivery,
+    WebhookEvent,
 )
 from agentauth.db.session import close_db, get_db, init_db
-from agentauth.db.stores import agent_store, audit_log_store, policy_store
+from agentauth.db.stores import agent_store, audit_log_store, policy_store, webhook_store
+from agentauth.webhooks.dispatcher import dispatch_webhooks
 
 logger = structlog.get_logger(__name__)
 
@@ -47,20 +51,18 @@ async def lifespan(app: FastAPI):
     """Initialise resources on startup; clean up on shutdown."""
     global _engine
 
-    # Gemini engine
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY environment variable is required")
     model = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
     _engine = AgentAuthEngine(api_key=api_key, model=model)
 
-    # Database
     database_url = os.getenv("DATABASE_URL")
     if not database_url:
         raise RuntimeError("DATABASE_URL environment variable is required")
     await init_db(database_url)
 
-    logger.info("AgentAuth server started", model=model)
+    logger.info("AgentAuth server started", model=model, version="0.3.0")
     yield
 
     await close_db()
@@ -75,7 +77,7 @@ app = FastAPI(
         "Open-source identity and authentication layer for AI agents. "
         "Powered by Google Gemini. Built by Kibrnet PLC, Addis Ababa, Ethiopia."
     ),
-    version="0.2.0",
+    version="0.3.0",
     lifespan=lifespan,
     docs_url="/docs",
     redoc_url="/redoc",
@@ -125,12 +127,31 @@ class AuditLogResponse(BaseModel):
     decisions: list[PermissionDecision]
 
 
+class RegisterWebhookRequest(BaseModel):
+    url: str = Field(..., description="HTTPS endpoint that will receive payloads")
+    events: list[WebhookEvent] = Field(
+        default_factory=lambda: [WebhookEvent.ESCALATE],
+        description="Decision result types to subscribe to. Defaults to [ESCALATE].",
+    )
+    secret: str | None = Field(
+        default=None,
+        description="Optional HMAC secret for X-AgentAuth-Signature verification",
+    )
+
+
+class WebhookDeliveryResponse(BaseModel):
+    total: int
+    limit: int
+    offset: int
+    deliveries: list[WebhookDelivery]
+
+
 # ── Health ────────────────────────────────────────────────────────────────────
 
 @app.get("/health", tags=["System"])
 async def health_check() -> dict[str, str]:
     """Check server health."""
-    return {"status": "healthy", "version": "0.2.0"}
+    return {"status": "healthy", "version": "0.3.0"}
 
 
 # ── Agents ────────────────────────────────────────────────────────────────────
@@ -141,7 +162,6 @@ async def register_agent(
     db: AsyncSession = Depends(get_db),
 ) -> Agent:
     """Register a new AI agent with AgentAuth."""
-    # Validate that all referenced policies exist
     for pid in request.policy_ids:
         if not await policy_store.get(db, pid):
             raise HTTPException(
@@ -211,8 +231,6 @@ async def issue_agent_token(
 
     The token encodes the agent's ID, name, owner, scopes, and policies.
     Agents can present this token as a Bearer credential on the evaluate endpoint.
-
-    The token expires after `expires_in_hours` hours (default 24).
     """
     agent = await agent_store.get(db, agent_id)
     if not agent:
@@ -275,6 +293,7 @@ async def get_policy(
 async def evaluate_permission(
     agent_id: UUID,
     request: EvaluatePermissionRequest,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     token_agent_id: UUID | None = Depends(get_token_agent_id),
 ) -> PermissionDecision:
@@ -285,9 +304,8 @@ async def evaluate_permission(
     and returns ALLOW, DENY, or ESCALATE with a full explanation.
 
     If a Bearer JWT is supplied, it must belong to the same agent as the
-    path parameter (prevents one agent evaluating on behalf of another).
-
-    Every decision is recorded in the audit log.
+    path parameter. Every decision is recorded in the audit log. Matching
+    webhook subscriptions are fired asynchronously after the response.
     """
     if _engine is None:
         raise HTTPException(
@@ -295,7 +313,6 @@ async def evaluate_permission(
             detail="AgentAuth engine not initialised",
         )
 
-    # If a JWT was presented, verify it matches the path agent_id
     if token_agent_id is not None and token_agent_id != agent_id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -316,8 +333,11 @@ async def evaluate_permission(
 
     decision = await _engine.evaluate(agent, policies, permission)
 
-    # Persist to audit log (task 8)
+    # Persist to audit log
     await audit_log_store.record(db, decision)
+
+    # Fire webhooks in the background — does not block the response
+    background_tasks.add_task(dispatch_webhooks, decision, agent_id)
 
     return decision
 
@@ -332,16 +352,11 @@ async def evaluate_permission(
 )
 async def get_audit_log(
     agent_id: UUID,
-    limit: int = Query(default=50, ge=1, le=500, description="Max entries to return"),
-    offset: int = Query(default=0, ge=0, description="Pagination offset"),
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     db: AsyncSession = Depends(get_db),
 ) -> AuditLogResponse:
-    """
-    Return the audit trail of PermissionDecisions made for an agent.
-
-    Results are ordered by most recent first.  Use `limit` and `offset`
-    for pagination.
-    """
+    """Return the audit trail of PermissionDecisions for an agent (most recent first)."""
     agent = await agent_store.get(db, agent_id)
     if not agent:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")
@@ -349,12 +364,106 @@ async def get_audit_log(
     total = await audit_log_store.count_for_agent(db, agent_id)
     decisions = await audit_log_store.list_for_agent(db, agent_id, limit=limit, offset=offset)
 
-    return AuditLogResponse(
-        total=total,
-        limit=limit,
-        offset=offset,
-        decisions=decisions,
+    return AuditLogResponse(total=total, limit=limit, offset=offset, decisions=decisions)
+
+
+# ── Webhooks ──────────────────────────────────────────────────────────────────
+
+@app.post(
+    "/agents/{agent_id}/webhooks",
+    response_model=Webhook,
+    status_code=status.HTTP_201_CREATED,
+    tags=["Webhooks"],
+    summary="Register a webhook for an agent",
+)
+async def register_webhook(
+    agent_id: UUID,
+    request: RegisterWebhookRequest,
+    db: AsyncSession = Depends(get_db),
+) -> Webhook:
+    """
+    Register a webhook URL to receive PermissionDecision notifications for an agent.
+
+    ``events`` controls which result types trigger delivery (default: ESCALATE only).
+    Set ``secret`` to enable HMAC-SHA256 request signing via X-AgentAuth-Signature.
+    """
+    agent = await agent_store.get(db, agent_id)
+    if not agent:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")
+
+    webhook = Webhook(
+        agent_id=agent_id,
+        url=request.url,
+        events=request.events,
+        secret=request.secret,
     )
+    return await webhook_store.create(db, webhook)
+
+
+@app.get(
+    "/agents/{agent_id}/webhooks",
+    response_model=list[Webhook],
+    tags=["Webhooks"],
+    summary="List webhooks for an agent",
+)
+async def list_webhooks(
+    agent_id: UUID,
+    active_only: bool = Query(default=False, description="Only return active webhooks"),
+    db: AsyncSession = Depends(get_db),
+) -> list[Webhook]:
+    """List all webhook registrations for an agent."""
+    agent = await agent_store.get(db, agent_id)
+    if not agent:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")
+
+    return await webhook_store.list_for_agent(db, agent_id, active_only=active_only)
+
+
+@app.delete(
+    "/webhooks/{webhook_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    tags=["Webhooks"],
+    summary="Delete a webhook",
+)
+async def delete_webhook(
+    webhook_id: UUID,
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    """
+    Permanently delete a webhook and its delivery history.
+    Returns 204 No Content on success, 404 if not found.
+    """
+    deleted = await webhook_store.hard_delete(db, webhook_id)
+    if not deleted:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Webhook not found")
+
+
+@app.get(
+    "/webhooks/{webhook_id}/deliveries",
+    response_model=WebhookDeliveryResponse,
+    tags=["Webhooks"],
+    summary="Inspect delivery history for a webhook",
+)
+async def get_webhook_deliveries(
+    webhook_id: UUID,
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    db: AsyncSession = Depends(get_db),
+) -> WebhookDeliveryResponse:
+    """
+    Return the delivery attempt history for a webhook (most recent first).
+
+    Use this to debug failed deliveries, check retry outcomes, and verify
+    your endpoint is receiving payloads correctly.
+    """
+    webhook = await webhook_store.get(db, webhook_id)
+    if not webhook:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Webhook not found")
+
+    total = await webhook_store.count_deliveries(db, webhook_id)
+    deliveries = await webhook_store.list_deliveries(db, webhook_id, limit=limit, offset=offset)
+
+    return WebhookDeliveryResponse(total=total, limit=limit, offset=offset, deliveries=deliveries)
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
