@@ -1,12 +1,10 @@
 """
-AgentAuth REST API Server — v0.3.0
+AgentAuth REST API Server — v0.4.0
 
-Changes from v0.2.0:
-  - POST /agents/{id}/webhooks   — register a webhook URL for an agent
-  - GET  /agents/{id}/webhooks   — list webhooks for an agent
-  - DELETE /webhooks/{id}        — remove a webhook
-  - GET  /webhooks/{id}/deliveries — inspect delivery history
-  - After every /evaluate, matching webhooks are fired as a BackgroundTask
+Changes from v0.3.0:
+  - GET  /templates                   — list all available policy templates
+  - GET  /templates/{name}            — get a specific template by name
+  - POST /policies/from-template      — create a policy from a template (with optional overrides)
 """
 
 from __future__ import annotations
@@ -37,6 +35,7 @@ from agentauth.core.models import (
 )
 from agentauth.db.session import close_db, get_db, init_db
 from agentauth.db.stores import agent_store, audit_log_store, policy_store, webhook_store
+from agentauth.templates import PolicyTemplate, registry
 from agentauth.webhooks.dispatcher import dispatch_webhooks
 
 logger = structlog.get_logger(__name__)
@@ -62,7 +61,7 @@ async def lifespan(app: FastAPI):
         raise RuntimeError("DATABASE_URL environment variable is required")
     await init_db(database_url)
 
-    logger.info("AgentAuth server started", model=model, version="0.3.0")
+    logger.info("AgentAuth server started", model=model, version="0.4.0")
     yield
 
     await close_db()
@@ -77,7 +76,7 @@ app = FastAPI(
         "Open-source identity and authentication layer for AI agents. "
         "Powered by Google Gemini. Built by Kibrnet PLC, Addis Ababa, Ethiopia."
     ),
-    version="0.3.0",
+    version="0.4.0",
     lifespan=lifespan,
     docs_url="/docs",
     redoc_url="/redoc",
@@ -151,7 +150,7 @@ class WebhookDeliveryResponse(BaseModel):
 @app.get("/health", tags=["System"])
 async def health_check() -> dict[str, str]:
     """Check server health."""
-    return {"status": "healthy", "version": "0.3.0"}
+    return {"status": "healthy", "version": "0.4.0"}
 
 
 # ── Agents ────────────────────────────────────────────────────────────────────
@@ -464,6 +463,143 @@ async def get_webhook_deliveries(
     deliveries = await webhook_store.list_deliveries(db, webhook_id, limit=limit, offset=offset)
 
     return WebhookDeliveryResponse(total=total, limit=limit, offset=offset, deliveries=deliveries)
+
+
+# ── Policy Templates ──────────────────────────────────────────────────────────
+
+class CreatePolicyFromTemplateRequest(BaseModel):
+    template_name: str = Field(
+        ...,
+        description="Template name, e.g. 'nbe_payment_agent'. See GET /templates for the full list.",
+    )
+    policy_name: str = Field(
+        ...,
+        min_length=1,
+        max_length=100,
+        description="Name for the resulting policy.",
+    )
+    description: str = Field(
+        default="",
+        description="Optional description. Defaults to the template description.",
+    )
+    overrides: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Additional rules appended after the template's base rules. "
+            "Use these to tighten constraints for your specific deployment."
+        ),
+    )
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+@app.get(
+    "/templates",
+    tags=["Templates"],
+    summary="List all available policy templates",
+)
+async def list_templates(
+    regulator: str | None = Query(default=None, description="Filter by regulator, e.g. 'NBE'"),
+    tag: str | None = Query(default=None, description="Filter by tag, e.g. 'payment'"),
+) -> list[dict]:
+    """
+    Return all registered policy templates.
+
+    Templates are pre-built natural language rule sets based on African
+    regulatory frameworks. Currently includes 7 NBE Ethiopia templates.
+
+    Use ``regulator`` or ``tag`` query params to filter results.
+    """
+    if regulator:
+        templates = registry.list_by_regulator(regulator)
+    elif tag:
+        templates = registry.list_by_tag(tag)
+    else:
+        templates = registry.list_all()
+
+    return [t.to_dict() for t in templates]
+
+
+@app.get(
+    "/templates/{template_name}",
+    tags=["Templates"],
+    summary="Get a specific policy template by name",
+)
+async def get_template(template_name: str) -> dict:
+    """
+    Return a single template by its name (e.g. ``nbe_payment_agent``).
+
+    The response includes the full rule set, regulatory references,
+    and metadata. Use ``POST /policies/from-template`` to create a
+    policy from this template.
+    """
+    template = registry.get_by_name(template_name)
+    if not template:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=(
+                f"Template '{template_name}' not found. "
+                f"Call GET /templates to see available templates."
+            ),
+        )
+    return template.to_dict()
+
+
+@app.post(
+    "/policies/from-template",
+    response_model=Policy,
+    status_code=status.HTTP_201_CREATED,
+    tags=["Templates"],
+    summary="Create a policy from a template",
+)
+async def create_policy_from_template(
+    request: CreatePolicyFromTemplateRequest,
+    db: AsyncSession = Depends(get_db),
+) -> Policy:
+    """
+    Create a new policy using a pre-built NBE policy template as the base.
+
+    The resulting policy is stored exactly like any other policy and can be
+    assigned to agents immediately. ``overrides`` are additional rules
+    appended after the template's base rules — use them to tighten constraints
+    for your specific deployment without losing the regulatory baseline.
+
+    Example:
+    ```json
+    {
+        "template_name": "nbe_payment_agent",
+        "policy_name": "my-payment-policy",
+        "overrides": [
+            "Agent may not process payments above ETB 10,000 without supervisor approval"
+        ]
+    }
+    ```
+    """
+    template = registry.get_by_name(request.template_name)
+    if not template:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=(
+                f"Template '{request.template_name}' not found. "
+                f"Call GET /templates to see available templates."
+            ),
+        )
+
+    rules = registry.build_rules(template.name, overrides=request.overrides or None)
+
+    policy = Policy(
+        name=request.policy_name,
+        description=request.description or template.description,
+        rules=rules,
+        metadata={
+            **request.metadata,
+            "template": template.name.value,
+            "template_version": template.version,
+            "regulator": template.regulator,
+            "jurisdiction": template.jurisdiction,
+            "override_count": len(request.overrides),
+        },
+    )
+    return await policy_store.create(db, policy)
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
