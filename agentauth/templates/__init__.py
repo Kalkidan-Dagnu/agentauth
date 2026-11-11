@@ -2,7 +2,7 @@
 AgentAuth Policy Templates.
 
 Pre-built natural language policy rule sets based on African regulatory
-frameworks. Currently includes NBE Ethiopia (7 templates).
+frameworks. Includes NBE Ethiopia (7 templates) and CBN Nigeria (5 templates).
 
 Quick start:
 
