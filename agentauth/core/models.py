@@ -218,3 +218,76 @@ class WebhookPayload(BaseModel):
     delivered_at: datetime = Field(default_factory=datetime.utcnow)
 
     model_config = {"json_encoders": {UUID: str, datetime: lambda v: v.isoformat()}}
+
+
+# ── Organisation (multi-tenant) models ─────────────────────────────────────────
+
+
+class Organization(BaseModel):
+    """
+    A tenant organisation.
+
+    All agents, policies, webhooks, and audit log entries are scoped to an
+    organisation. Data isolation is enforced at the store and API layer —
+    one org cannot see another org's data.
+
+    Organisations authenticate via API keys (OrgApiKey) rather than JWT agent
+    tokens. The API key is passed as ``X-API-Key`` header on every request.
+    """
+    id: UUID = Field(default_factory=uuid4)
+    name: str = Field(..., min_length=1, max_length=100)
+    slug: str = Field(
+        ...,
+        min_length=1,
+        max_length=100,
+        description="URL-friendly identifier, must be unique across all orgs.",
+    )
+    description: str = Field(default="")
+    owner_id: str = Field(..., description="ID of the user who created this org")
+    is_active: bool = Field(default=True)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    model_config = {"json_encoders": {UUID: str, datetime: lambda v: v.isoformat()}}
+
+
+class OrgApiKey(BaseModel):
+    """
+    An API key scoped to an organisation.
+
+    The plaintext key is returned ONLY once, in the ``key`` field of
+    ``OrgApiKeyIssuance``, at creation time. Only the SHA-256 hash is
+    stored in the database — the plaintext is never retrievable again.
+
+    Key format: ``aak_<32-char-random>`` (aak = AgentAuth Key)
+    Sent by clients as ``X-API-Key`` header.
+    """
+    id: UUID = Field(default_factory=uuid4)
+    org_id: UUID
+    name: str = Field(..., min_length=1, max_length=100, description="Label, e.g. 'Production'")
+    key_prefix: str = Field(
+        ...,
+        description="First 8 chars of the plaintext key, shown for identification.",
+    )
+    is_active: bool = Field(default=True)
+    last_used_at: datetime | None = Field(default=None)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+    model_config = {"json_encoders": {UUID: str, datetime: lambda v: v.isoformat()}}
+
+
+class OrgApiKeyIssuance(BaseModel):
+    """
+    The full response when a new API key is issued.
+
+    Contains the OrgApiKey metadata plus the plaintext ``key`` which is
+    only ever returned once. The caller must store it securely — it
+    cannot be retrieved again.
+    """
+    api_key: OrgApiKey
+    key: str = Field(
+        ...,
+        description="The full plaintext API key. Returned only once — store it securely.",
+    )
+
+    model_config = {"json_encoders": {UUID: str, datetime: lambda v: v.isoformat()}}
