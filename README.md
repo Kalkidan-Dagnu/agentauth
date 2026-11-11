@@ -1,7 +1,8 @@
 # AgentAuth
 
-**Open-source identity and authentication layer for AI agents.**
-Powered by Google Gemini. Built by [Kibrnet PLC](https://github.com/kibrnet), Addis Ababa, Ethiopia.
+> Open-source identity and authentication layer for AI agents — powered by Google Gemini.
+
+Built by **[Kalkidan Dagnu](https://github.com/Kalkidan-Dagnu)** · [Kibrnet PLC](https://github.com/kibrnet) · Addis Ababa, Ethiopia
 
 ---
 
@@ -139,13 +140,30 @@ Provide developers building AI products a drop-in security layer so they don't h
 
 ## API Reference
 
+### Organisations
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/orgs` | Create a new organisation |
+| `GET` | `/orgs/{id}` | Get organisation details |
+| `POST` | `/orgs/{id}/api-keys` | Issue an API key for an org |
+| `GET` | `/orgs/{id}/api-keys` | List API keys for an org |
+
 ### Policies
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | `POST` | `/policies` | Create a policy with natural language rules |
-| `GET` | `/policies` | List all policies |
+| `GET` | `/policies` | List all policies (org-scoped) |
 | `GET` | `/policies/{id}` | Get a policy by ID |
+| `POST` | `/policies/from-template` | Create a policy from an NBE/CBN template |
+
+### Templates
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/templates` | List all available policy templates |
+| `GET` | `/templates/{name}` | Get a specific template by name |
 
 ### Agents
 
@@ -155,6 +173,7 @@ Provide developers building AI products a drop-in security layer so they don't h
 | `GET` | `/agents?owner_id=` | List agents by owner |
 | `GET` | `/agents/{id}` | Get an agent by ID |
 | `POST` | `/agents/{id}/deactivate` | Deactivate an agent |
+| `POST` | `/agents/{id}/token` | Issue a signed JWT for an agent |
 
 ### Permissions
 
@@ -162,7 +181,22 @@ Provide developers building AI products a drop-in security layer so they don't h
 |--------|----------|-------------|
 | `POST` | `/agents/{id}/evaluate` | Evaluate a permission request |
 
-Full interactive docs available at `http://localhost:8000/docs` when the server is running.
+### Audit Log
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/agents/{id}/audit` | Query decision history for an agent |
+
+### Webhooks
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/agents/{id}/webhooks` | Register a webhook for an agent |
+| `GET` | `/agents/{id}/webhooks` | List webhooks for an agent |
+| `DELETE` | `/webhooks/{id}` | Delete a webhook |
+| `GET` | `/webhooks/{id}/deliveries` | Inspect delivery history |
+
+All endpoints except `/health`, `/templates`, and `/orgs` (POST) require an `X-API-Key` header for org authentication.
 
 ---
 
@@ -208,16 +242,34 @@ agentauth/
 ├── agentauth/
 │   ├── core/
 │   │   ├── engine.py      # Gemini permission reasoning engine
-│   │   ├── models.py      # Agent, Policy, Permission, PermissionDecision
-│   │   └── store.py       # In-memory agent and policy registry
+│   │   └── models.py      # Agent, Policy, Permission, PermissionDecision, Webhook, Organization
 │   ├── api/
-│   │   └── server.py      # FastAPI REST server
-│   └── sdk/
-│       └── client.py      # Python SDK client
+│   │   ├── server.py      # FastAPI REST server (v0.5.0)
+│   │   ├── auth.py        # JWT agent identity tokens
+│   │   └── tenancy.py     # Multi-tenant API key auth
+│   ├── db/
+│   │   ├── models.py      # SQLAlchemy ORM models
+│   │   ├── session.py     # Async DB session + engine setup
+│   │   └── stores.py      # DB-backed stores (agents, policies, webhooks, audit, orgs)
+│   ├── sdk/
+│   │   └── client.py      # Python SDK client
+│   ├── templates/
+│   │   ├── registry.py    # Template registry + PolicyTemplate enum
+│   │   ├── nbe.py         # NBE Ethiopia templates (7 templates)
+│   │   └── cbn.py         # CBN Nigeria templates (5 templates)
+│   └── webhooks/
+│       └── dispatcher.py  # Webhook delivery with retry + backoff
+├── alembic/
+│   └── versions/         # Database migrations
 ├── tests/
 │   ├── test_models.py
 │   ├── test_store.py
-│   └── test_api.py
+│   ├── test_api.py
+│   ├── test_auth.py
+│   ├── test_webhooks.py
+│   ├── test_templates.py
+│   ├── test_cbn_templates.py
+│   └── test_tenancy.py
 ├── .env.example
 ├── pyproject.toml
 └── README.md
@@ -227,14 +279,14 @@ agentauth/
 
 ## Roadmap
 
-- [ ] Persistent storage (PostgreSQL)
-- [ ] JWT-based agent identity tokens
+- [x] Persistent storage (PostgreSQL)
+- [x] JWT-based agent identity tokens
+- [x] Audit log with full decision trail
+- [x] Webhook notifications for ESCALATE decisions
+- [x] Policy templates for African regulatory contexts (NBE Ethiopia, CBN Nigeria)
+- [x] Multi-tenant support
 - [ ] Gemma support for on-device / offline evaluation
 - [ ] Java SDK
-- [ ] Audit log with full decision trail
-- [ ] Policy templates for African regulatory contexts (NBE Ethiopia, CBN Nigeria)
-- [ ] Multi-tenant support
-- [ ] Webhook notifications for ESCALATE decisions
 
 ---
 
@@ -242,7 +294,7 @@ agentauth/
 
 AgentAuth is built by **Kalkidan Dagnu**, co-founder of [Kibrnet PLC](https://github.com/kibrnet) in Addis Ababa, Ethiopia.
 
-This project is inspired by the work of Bereket Engida (Better Auth) and the broader movement of world-class developer infrastructure being built from Africa.
+This project is part of the broader movement of world-class developer infrastructure being built from Africa.
 
 The goal: give every African AI developer a secure, production-ready identity layer for their agents — so they can focus on building, not on reinventing security from scratch.
 
