@@ -1,10 +1,13 @@
 """
-AgentAuth REST API Server — v0.4.0
+AgentAuth REST API Server — v0.5.0
 
-Changes from v0.3.0:
-  - GET  /templates                   — list all available policy templates
-  - GET  /templates/{name}            — get a specific template by name
-  - POST /policies/from-template      — create a policy from a template (with optional overrides)
+Changes from v0.4.0:
+  - POST /orgs                         — create an organisation
+  - GET  /orgs/{id}                     — get org details
+  - POST /orgs/{id}/api-keys            — issue an org API key
+  - GET  /orgs/{id}/api-keys            — list org API keys
+  - All existing endpoints (agents, policies, webhooks, audit, templates)
+    are now scoped to the caller's organisation via X-API-Key header
 """
 
 from __future__ import annotations
@@ -21,11 +24,15 @@ from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agentauth.api.auth import get_token_agent_id, issue_token
+from agentauth.api.tenancy import get_current_org, issue_api_key
 from agentauth.core.engine import AgentAuthEngine
 from agentauth.core.models import (
     Agent,
     AgentIdentity,
     AgentScope,
+    Organization,
+    OrgApiKey,
+    OrgApiKeyIssuance,
     Permission,
     PermissionDecision,
     Policy,
@@ -34,22 +41,25 @@ from agentauth.core.models import (
     WebhookEvent,
 )
 from agentauth.db.session import close_db, get_db, init_db
-from agentauth.db.stores import agent_store, audit_log_store, policy_store, webhook_store
-from agentauth.templates import PolicyTemplate, registry
+from agentauth.db.stores import (
+    agent_store,
+    audit_log_store,
+    org_api_key_store,
+    organization_store,
+    policy_store,
+    webhook_store,
+)
+from agentauth.templates import registry
 from agentauth.webhooks.dispatcher import dispatch_webhooks
 
 logger = structlog.get_logger(__name__)
-
-# ── Global engine (stateless; no DB needed) ───────────────────────────────────
 
 _engine: AgentAuthEngine | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Initialise resources on startup; clean up on shutdown."""
     global _engine
-
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY environment variable is required")
@@ -61,14 +71,11 @@ async def lifespan(app: FastAPI):
         raise RuntimeError("DATABASE_URL environment variable is required")
     await init_db(database_url)
 
-    logger.info("AgentAuth server started", model=model, version="0.4.0")
+    logger.info("AgentAuth server started", model=model, version="0.5.0")
     yield
-
     await close_db()
     logger.info("AgentAuth server shutting down")
 
-
-# ── App setup ─────────────────────────────────────────────────────────────────
 
 app = FastAPI(
     title="AgentAuth",
@@ -76,7 +83,7 @@ app = FastAPI(
         "Open-source identity and authentication layer for AI agents. "
         "Powered by Google Gemini. Built by Kibrnet PLC, Addis Ababa, Ethiopia."
     ),
-    version="0.4.0",
+    version="0.5.0",
     lifespan=lifespan,
     docs_url="/docs",
     redoc_url="/redoc",
@@ -92,6 +99,18 @@ app.add_middleware(
 
 
 # ── Request / Response schemas ────────────────────────────────────────────────
+
+class CreateOrgRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100)
+    slug: str = Field(..., min_length=1, max_length=100, description="URL-friendly unique identifier")
+    description: str = ""
+    owner_id: str = Field(..., description="ID of the user creating this org")
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class CreateApiKeyRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100, description="Label, e.g. 'Production'")
+
 
 class RegisterAgentRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=100)
@@ -116,7 +135,7 @@ class EvaluatePermissionRequest(BaseModel):
 
 
 class IssueTokenRequest(BaseModel):
-    expires_in_hours: int = Field(default=24, ge=1, le=8760, description="Token lifetime in hours")
+    expires_in_hours: int = Field(default=24, ge=1, le=8760)
 
 
 class AuditLogResponse(BaseModel):
@@ -128,14 +147,8 @@ class AuditLogResponse(BaseModel):
 
 class RegisterWebhookRequest(BaseModel):
     url: str = Field(..., description="HTTPS endpoint that will receive payloads")
-    events: list[WebhookEvent] = Field(
-        default_factory=lambda: [WebhookEvent.ESCALATE],
-        description="Decision result types to subscribe to. Defaults to [ESCALATE].",
-    )
-    secret: str | None = Field(
-        default=None,
-        description="Optional HMAC secret for X-AgentAuth-Signature verification",
-    )
+    events: list[WebhookEvent] = Field(default_factory=lambda: [WebhookEvent.ESCALATE])
+    secret: str | None = Field(default=None)
 
 
 class WebhookDeliveryResponse(BaseModel):
@@ -145,29 +158,139 @@ class WebhookDeliveryResponse(BaseModel):
     deliveries: list[WebhookDelivery]
 
 
-# ── Health ────────────────────────────────────────────────────────────────────
+class CreatePolicyFromTemplateRequest(BaseModel):
+    template_name: str = Field(...)
+    policy_name: str = Field(..., min_length=1, max_length=100)
+    description: str = ""
+    overrides: list[str] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+# ── Health (no auth required) ─────────────────────────────────────────────────
 
 @app.get("/health", tags=["System"])
 async def health_check() -> dict[str, str]:
-    """Check server health."""
-    return {"status": "healthy", "version": "0.4.0"}
+    return {"status": "healthy", "version": "0.5.0"}
 
 
-# ── Agents ────────────────────────────────────────────────────────────────────
+# ── Organisations (no auth — creation is open) ────────────────────────────────
+
+@app.post(
+    "/orgs",
+    response_model=Organization,
+    status_code=status.HTTP_201_CREATED,
+    tags=["Organisations"],
+    summary="Create a new organisation",
+)
+async def create_org(
+    request: CreateOrgRequest,
+    db: AsyncSession = Depends(get_db),
+) -> Organization:
+    """
+    Create a new tenant organisation.
+
+    After creating an org, call POST /orgs/{id}/api-keys to get an API key.
+    Use that key as the X-API-Key header for all subsequent requests.
+    """
+    if await organization_store.slug_exists(db, request.slug):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Organisation with slug '{request.slug}' already exists.",
+        )
+    org = Organization(
+        name=request.name,
+        slug=request.slug.lower(),
+        description=request.description,
+        owner_id=request.owner_id,
+        metadata=request.metadata,
+    )
+    return await organization_store.create(db, org)
+
+
+@app.get(
+    "/orgs/{org_id}",
+    response_model=Organization,
+    tags=["Organisations"],
+    summary="Get organisation details",
+)
+async def get_org(
+    org_id: UUID,
+    org: Organization = Depends(get_current_org),
+    db: AsyncSession = Depends(get_db),
+) -> Organization:
+    """Get details for an organisation. Requires the caller's own API key."""
+    if org.id != org_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="API key does not belong to this organisation.",
+        )
+    return org
+
+
+# ── Org API Keys ──────────────────────────────────────────────────────────────
+
+@app.post(
+    "/orgs/{org_id}/api-keys",
+    response_model=OrgApiKeyIssuance,
+    status_code=status.HTTP_201_CREATED,
+    tags=["Organisations"],
+    summary="Issue a new API key for an organisation",
+)
+async def create_api_key(
+    org_id: UUID,
+    request: CreateApiKeyRequest,
+    org: Organization = Depends(get_current_org),
+    db: AsyncSession = Depends(get_db),
+) -> OrgApiKeyIssuance:
+    """
+    Generate a new API key for the organisation.
+
+    The plaintext key is returned ONLY in this response — store it securely.
+    It cannot be retrieved again. Use it as the X-API-Key header.
+    """
+    if org.id != org_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="API key does not belong to this organisation.",
+        )
+    return await issue_api_key(db, org_id, request.name)
+
+
+@app.get(
+    "/orgs/{org_id}/api-keys",
+    response_model=list[OrgApiKey],
+    tags=["Organisations"],
+    summary="List API keys for an organisation",
+)
+async def list_api_keys(
+    org_id: UUID,
+    org: Organization = Depends(get_current_org),
+    db: AsyncSession = Depends(get_db),
+) -> list[OrgApiKey]:
+    """List all API keys for the organisation (metadata only — no plaintext keys)."""
+    if org.id != org_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="API key does not belong to this organisation.",
+        )
+    return await org_api_key_store.list_for_org(db, org_id)
+
+
+# ── Agents (org-scoped) ───────────────────────────────────────────────────────
 
 @app.post("/agents", response_model=Agent, status_code=status.HTTP_201_CREATED, tags=["Agents"])
 async def register_agent(
     request: RegisterAgentRequest,
+    org: Organization = Depends(get_current_org),
     db: AsyncSession = Depends(get_db),
 ) -> Agent:
-    """Register a new AI agent with AgentAuth."""
+    """Register a new AI agent within the caller's organisation."""
     for pid in request.policy_ids:
-        if not await policy_store.get(db, pid):
+        if not await policy_store.get(db, pid, org_id=org.id):
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Policy {pid} not found",
+                detail=f"Policy {pid} not found in this organisation.",
             )
-
     agent = Agent(
         name=request.name,
         owner_id=request.owner_id,
@@ -176,25 +299,27 @@ async def register_agent(
         description=request.description,
         metadata=request.metadata,
     )
-    return await agent_store.register(db, agent)
+    return await agent_store.register(db, agent, org.id)
 
 
 @app.get("/agents", response_model=list[Agent], tags=["Agents"])
 async def list_agents(
     owner_id: str,
+    org: Organization = Depends(get_current_org),
     db: AsyncSession = Depends(get_db),
 ) -> list[Agent]:
-    """List all agents for an owner."""
-    return await agent_store.list_by_owner(db, owner_id)
+    """List all agents for an owner within the caller's organisation."""
+    return await agent_store.list_by_owner(db, owner_id, org.id)
 
 
 @app.get("/agents/{agent_id}", response_model=Agent, tags=["Agents"])
 async def get_agent(
     agent_id: UUID,
+    org: Organization = Depends(get_current_org),
     db: AsyncSession = Depends(get_db),
 ) -> Agent:
-    """Fetch an agent by ID."""
-    agent = await agent_store.get(db, agent_id)
+    """Fetch an agent by ID (must belong to the caller's org)."""
+    agent = await agent_store.get(db, agent_id, org_id=org.id)
     if not agent:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")
     return agent
@@ -203,16 +328,17 @@ async def get_agent(
 @app.post("/agents/{agent_id}/deactivate", tags=["Agents"])
 async def deactivate_agent(
     agent_id: UUID,
+    org: Organization = Depends(get_current_org),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, bool]:
-    """Deactivate an agent. Deactivated agents cannot request permissions."""
-    success = await agent_store.deactivate(db, agent_id)
+    """Deactivate an agent (must belong to the caller's org)."""
+    success = await agent_store.deactivate(db, agent_id, org_id=org.id)
     if not success:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")
     return {"success": True}
 
 
-# ── Token issuance ────────────────────────────────────────────────────────────
+# ── Token issuance (org-scoped) ───────────────────────────────────────────────
 
 @app.post(
     "/agents/{agent_id}/token",
@@ -223,66 +349,59 @@ async def deactivate_agent(
 async def issue_agent_token(
     agent_id: UUID,
     request: IssueTokenRequest = IssueTokenRequest(),
+    org: Organization = Depends(get_current_org),
     db: AsyncSession = Depends(get_db),
 ) -> AgentIdentity:
-    """
-    Issue a signed JWT identity token for an agent.
-
-    The token encodes the agent's ID, name, owner, scopes, and policies.
-    Agents can present this token as a Bearer credential on the evaluate endpoint.
-    """
-    agent = await agent_store.get(db, agent_id)
+    """Issue a signed JWT identity token for an agent."""
+    agent = await agent_store.get(db, agent_id, org_id=org.id)
     if not agent:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")
     if not agent.is_active:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Cannot issue token for a deactivated agent",
-        )
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot issue token for a deactivated agent")
     return issue_token(agent, expires_in_hours=request.expires_in_hours)
 
 
-# ── Policies ──────────────────────────────────────────────────────────────────
+# ── Policies (org-scoped) ────────────────────────────────────────────────────
 
-@app.post(
-    "/policies",
-    response_model=Policy,
-    status_code=status.HTTP_201_CREATED,
-    tags=["Policies"],
-)
+@app.post("/policies", response_model=Policy, status_code=status.HTTP_201_CREATED, tags=["Policies"])
 async def create_policy(
     request: CreatePolicyRequest,
+    org: Organization = Depends(get_current_org),
     db: AsyncSession = Depends(get_db),
 ) -> Policy:
-    """Create a new policy with natural language rules."""
+    """Create a new policy within the caller's organisation."""
     policy = Policy(
         name=request.name,
         rules=request.rules,
         description=request.description,
         metadata=request.metadata,
     )
-    return await policy_store.create(db, policy)
+    return await policy_store.create(db, policy, org.id)
 
 
 @app.get("/policies", response_model=list[Policy], tags=["Policies"])
-async def list_policies(db: AsyncSession = Depends(get_db)) -> list[Policy]:
-    """List all policies."""
-    return await policy_store.list_all(db)
+async def list_policies(
+    org: Organization = Depends(get_current_org),
+    db: AsyncSession = Depends(get_db),
+) -> list[Policy]:
+    """List all policies in the caller's organisation."""
+    return await policy_store.list_all(db, org.id)
 
 
 @app.get("/policies/{policy_id}", response_model=Policy, tags=["Policies"])
 async def get_policy(
     policy_id: UUID,
+    org: Organization = Depends(get_current_org),
     db: AsyncSession = Depends(get_db),
 ) -> Policy:
-    """Fetch a policy by ID."""
-    policy = await policy_store.get(db, policy_id)
+    """Fetch a policy by ID (must belong to the caller's org)."""
+    policy = await policy_store.get(db, policy_id, org_id=org.id)
     if not policy:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Policy not found")
     return policy
 
 
-# ── Permission Evaluation ─────────────────────────────────────────────────────
+# ── Permission Evaluation (org-scoped) ────────────────────────────────────────
 
 @app.post(
     "/agents/{agent_id}/evaluate",
@@ -293,36 +412,22 @@ async def evaluate_permission(
     agent_id: UUID,
     request: EvaluatePermissionRequest,
     background_tasks: BackgroundTasks,
+    org: Organization = Depends(get_current_org),
     db: AsyncSession = Depends(get_db),
     token_agent_id: UUID | None = Depends(get_token_agent_id),
 ) -> PermissionDecision:
-    """
-    Evaluate whether an agent is permitted to perform an action.
-
-    Uses Google Gemini to reason over the agent's natural language policies
-    and returns ALLOW, DENY, or ESCALATE with a full explanation.
-
-    If a Bearer JWT is supplied, it must belong to the same agent as the
-    path parameter. Every decision is recorded in the audit log. Matching
-    webhook subscriptions are fired asynchronously after the response.
-    """
+    """Evaluate whether an agent is permitted to perform an action."""
     if _engine is None:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="AgentAuth engine not initialised",
-        )
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="AgentAuth engine not initialised")
 
     if token_agent_id is not None and token_agent_id != agent_id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Bearer token does not match the agent_id in the request path",
-        )
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Bearer token does not match the agent_id in the request path")
 
-    agent = await agent_store.get(db, agent_id)
+    agent = await agent_store.get(db, agent_id, org_id=org.id)
     if not agent:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")
 
-    policies = await policy_store.get_many(db, agent.policy_ids)
+    policies = await policy_store.get_many(db, agent.policy_ids, org_id=org.id)
 
     permission = Permission(
         action=request.action,
@@ -332,16 +437,16 @@ async def evaluate_permission(
 
     decision = await _engine.evaluate(agent, policies, permission)
 
-    # Persist to audit log
-    await audit_log_store.record(db, decision)
+    # Persist to audit log (org-scoped)
+    await audit_log_store.record(db, decision, org.id)
 
-    # Fire webhooks in the background — does not block the response
+    # Fire webhooks in the background
     background_tasks.add_task(dispatch_webhooks, decision, agent_id)
 
     return decision
 
 
-# ── Audit Log ─────────────────────────────────────────────────────────────────
+# ── Audit Log (org-scoped) ────────────────────────────────────────────────────
 
 @app.get(
     "/agents/{agent_id}/audit",
@@ -353,20 +458,21 @@ async def get_audit_log(
     agent_id: UUID,
     limit: int = Query(default=50, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
+    org: Organization = Depends(get_current_org),
     db: AsyncSession = Depends(get_db),
 ) -> AuditLogResponse:
-    """Return the audit trail of PermissionDecisions for an agent (most recent first)."""
-    agent = await agent_store.get(db, agent_id)
+    """Return the audit trail for an agent (must belong to the caller's org)."""
+    agent = await agent_store.get(db, agent_id, org_id=org.id)
     if not agent:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")
 
-    total = await audit_log_store.count_for_agent(db, agent_id)
-    decisions = await audit_log_store.list_for_agent(db, agent_id, limit=limit, offset=offset)
+    total = await audit_log_store.count_for_agent(db, agent_id, org_id=org.id)
+    decisions = await audit_log_store.list_for_agent(db, agent_id, org_id=org.id, limit=limit, offset=offset)
 
     return AuditLogResponse(total=total, limit=limit, offset=offset, decisions=decisions)
 
 
-# ── Webhooks ──────────────────────────────────────────────────────────────────
+# ── Webhooks (org-scoped) ─────────────────────────────────────────────────────
 
 @app.post(
     "/agents/{agent_id}/webhooks",
@@ -378,15 +484,11 @@ async def get_audit_log(
 async def register_webhook(
     agent_id: UUID,
     request: RegisterWebhookRequest,
+    org: Organization = Depends(get_current_org),
     db: AsyncSession = Depends(get_db),
 ) -> Webhook:
-    """
-    Register a webhook URL to receive PermissionDecision notifications for an agent.
-
-    ``events`` controls which result types trigger delivery (default: ESCALATE only).
-    Set ``secret`` to enable HMAC-SHA256 request signing via X-AgentAuth-Signature.
-    """
-    agent = await agent_store.get(db, agent_id)
+    """Register a webhook URL for an agent (must belong to the caller's org)."""
+    agent = await agent_store.get(db, agent_id, org_id=org.id)
     if not agent:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")
 
@@ -396,7 +498,7 @@ async def register_webhook(
         events=request.events,
         secret=request.secret,
     )
-    return await webhook_store.create(db, webhook)
+    return await webhook_store.create(db, webhook, org.id)
 
 
 @app.get(
@@ -407,15 +509,16 @@ async def register_webhook(
 )
 async def list_webhooks(
     agent_id: UUID,
-    active_only: bool = Query(default=False, description="Only return active webhooks"),
+    active_only: bool = Query(default=False),
+    org: Organization = Depends(get_current_org),
     db: AsyncSession = Depends(get_db),
 ) -> list[Webhook]:
     """List all webhook registrations for an agent."""
-    agent = await agent_store.get(db, agent_id)
+    agent = await agent_store.get(db, agent_id, org_id=org.id)
     if not agent:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")
 
-    return await webhook_store.list_for_agent(db, agent_id, active_only=active_only)
+    return await webhook_store.list_for_agent(db, agent_id, org_id=org.id, active_only=active_only)
 
 
 @app.delete(
@@ -426,13 +529,11 @@ async def list_webhooks(
 )
 async def delete_webhook(
     webhook_id: UUID,
+    org: Organization = Depends(get_current_org),
     db: AsyncSession = Depends(get_db),
 ) -> None:
-    """
-    Permanently delete a webhook and its delivery history.
-    Returns 204 No Content on success, 404 if not found.
-    """
-    deleted = await webhook_store.hard_delete(db, webhook_id)
+    """Permanently delete a webhook (must belong to the caller's org)."""
+    deleted = await webhook_store.hard_delete(db, webhook_id, org_id=org.id)
     if not deleted:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Webhook not found")
 
@@ -447,15 +548,11 @@ async def get_webhook_deliveries(
     webhook_id: UUID,
     limit: int = Query(default=50, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
+    org: Organization = Depends(get_current_org),
     db: AsyncSession = Depends(get_db),
 ) -> WebhookDeliveryResponse:
-    """
-    Return the delivery attempt history for a webhook (most recent first).
-
-    Use this to debug failed deliveries, check retry outcomes, and verify
-    your endpoint is receiving payloads correctly.
-    """
-    webhook = await webhook_store.get(db, webhook_id)
+    """Return delivery history for a webhook (must belong to the caller's org)."""
+    webhook = await webhook_store.get(db, webhook_id, org_id=org.id)
     if not webhook:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Webhook not found")
 
@@ -465,82 +562,29 @@ async def get_webhook_deliveries(
     return WebhookDeliveryResponse(total=total, limit=limit, offset=offset, deliveries=deliveries)
 
 
-# ── Policy Templates ──────────────────────────────────────────────────────────
+# ── Policy Templates (no auth — browsing is open) ────────────────────────────
 
-class CreatePolicyFromTemplateRequest(BaseModel):
-    template_name: str = Field(
-        ...,
-        description="Template name, e.g. 'nbe_payment_agent'. See GET /templates for the full list.",
-    )
-    policy_name: str = Field(
-        ...,
-        min_length=1,
-        max_length=100,
-        description="Name for the resulting policy.",
-    )
-    description: str = Field(
-        default="",
-        description="Optional description. Defaults to the template description.",
-    )
-    overrides: list[str] = Field(
-        default_factory=list,
-        description=(
-            "Additional rules appended after the template's base rules. "
-            "Use these to tighten constraints for your specific deployment."
-        ),
-    )
-    metadata: dict[str, Any] = Field(default_factory=dict)
-
-
-@app.get(
-    "/templates",
-    tags=["Templates"],
-    summary="List all available policy templates",
-)
+@app.get("/templates", tags=["Templates"], summary="List all available policy templates")
 async def list_templates(
-    regulator: str | None = Query(default=None, description="Filter by regulator, e.g. 'NBE'"),
-    tag: str | None = Query(default=None, description="Filter by tag, e.g. 'payment'"),
+    regulator: str | None = Query(default=None),
+    tag: str | None = Query(default=None),
 ) -> list[dict]:
-    """
-    Return all registered policy templates.
-
-    Templates are pre-built natural language rule sets based on African
-    regulatory frameworks. Currently includes 7 NBE Ethiopia templates.
-
-    Use ``regulator`` or ``tag`` query params to filter results.
-    """
+    """Return all registered policy templates."""
     if regulator:
         templates = registry.list_by_regulator(regulator)
     elif tag:
         templates = registry.list_by_tag(tag)
     else:
         templates = registry.list_all()
-
     return [t.to_dict() for t in templates]
 
 
-@app.get(
-    "/templates/{template_name}",
-    tags=["Templates"],
-    summary="Get a specific policy template by name",
-)
+@app.get("/templates/{template_name}", tags=["Templates"], summary="Get a specific template")
 async def get_template(template_name: str) -> dict:
-    """
-    Return a single template by its name (e.g. ``nbe_payment_agent``).
-
-    The response includes the full rule set, regulatory references,
-    and metadata. Use ``POST /policies/from-template`` to create a
-    policy from this template.
-    """
+    """Return a single template by name."""
     template = registry.get_by_name(template_name)
     if not template:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=(
-                f"Template '{template_name}' not found. "
-                f"Call GET /templates to see available templates."
-            ),
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Template '{template_name}' not found.")
     return template.to_dict()
 
 
@@ -553,36 +597,13 @@ async def get_template(template_name: str) -> dict:
 )
 async def create_policy_from_template(
     request: CreatePolicyFromTemplateRequest,
+    org: Organization = Depends(get_current_org),
     db: AsyncSession = Depends(get_db),
 ) -> Policy:
-    """
-    Create a new policy using a pre-built NBE policy template as the base.
-
-    The resulting policy is stored exactly like any other policy and can be
-    assigned to agents immediately. ``overrides`` are additional rules
-    appended after the template's base rules — use them to tighten constraints
-    for your specific deployment without losing the regulatory baseline.
-
-    Example:
-    ```json
-    {
-        "template_name": "nbe_payment_agent",
-        "policy_name": "my-payment-policy",
-        "overrides": [
-            "Agent may not process payments above ETB 10,000 without supervisor approval"
-        ]
-    }
-    ```
-    """
+    """Create a policy from a pre-built NBE template (org-scoped)."""
     template = registry.get_by_name(request.template_name)
     if not template:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=(
-                f"Template '{request.template_name}' not found. "
-                f"Call GET /templates to see available templates."
-            ),
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Template '{request.template_name}' not found.")
 
     rules = registry.build_rules(template.name, overrides=request.overrides or None)
 
@@ -599,18 +620,15 @@ async def create_policy_from_template(
             "override_count": len(request.overrides),
         },
     )
-    return await policy_store.create(db, policy)
+    return await policy_store.create(db, policy, org.id)
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    """Run the AgentAuth server."""
     import uvicorn
     from dotenv import load_dotenv
-
     load_dotenv()
-
     uvicorn.run(
         "agentauth.api.server:app",
         host=os.getenv("AGENTAUTH_HOST", "0.0.0.0"),

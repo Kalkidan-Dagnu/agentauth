@@ -1,11 +1,8 @@
 """
-Database-backed store implementations for AgentAuth.
+Database-backed store implementations for AgentAuth v0.5.0.
 
-Replaces the in-memory AgentStore and PolicyStore from core/store.py with
-async SQLAlchemy implementations backed by PostgreSQL (or SQLite in tests).
-
-All public methods mirror the interface of the in-memory stores so the
-server.py wiring changes are minimal.
+All data operations are org-scoped — writes accept org_id and reads filter
+by it. This is the core of multi-tenant data isolation.
 """
 
 from __future__ import annotations
@@ -15,7 +12,7 @@ from typing import Any
 from uuid import UUID
 
 import structlog
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agentauth.core.models import (
@@ -23,6 +20,8 @@ from agentauth.core.models import (
     AgentScope,
     ConfidenceLevel,
     DecisionResult,
+    Organization,
+    OrgApiKey,
     Permission,
     PermissionDecision,
     Policy,
@@ -30,7 +29,15 @@ from agentauth.core.models import (
     WebhookDelivery,
     WebhookEvent,
 )
-from agentauth.db.models import AgentRow, AuditLogRow, PolicyRow, WebhookDeliveryRow, WebhookRow
+from agentauth.db.models import (
+    AgentRow,
+    AuditLogRow,
+    OrganizationRow,
+    OrgApiKeyRow,
+    PolicyRow,
+    WebhookDeliveryRow,
+    WebhookRow,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -38,8 +45,20 @@ logger = structlog.get_logger(__name__)
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 
+def _policy_to_row(policy: Policy, org_id: UUID) -> PolicyRow:
+    return PolicyRow(
+        id=str(policy.id),
+        org_id=str(org_id),
+        name=policy.name,
+        description=policy.description,
+        rules=policy.rules,
+        metadata_=policy.metadata,
+        created_at=policy.created_at,
+        updated_at=policy.updated_at,
+    )
+
+
 def _row_to_policy(row: PolicyRow) -> Policy:
-    """Convert an ORM PolicyRow to a Pydantic Policy."""
     return Policy(
         id=UUID(row.id),
         name=row.name,
@@ -51,21 +70,22 @@ def _row_to_policy(row: PolicyRow) -> Policy:
     )
 
 
-def _policy_to_row(policy: Policy) -> PolicyRow:
-    """Convert a Pydantic Policy to an ORM PolicyRow."""
-    return PolicyRow(
-        id=str(policy.id),
-        name=policy.name,
-        description=policy.description,
-        rules=policy.rules,
-        metadata_=policy.metadata,
-        created_at=policy.created_at,
-        updated_at=policy.updated_at,
+def _agent_to_row(agent: Agent, org_id: UUID) -> AgentRow:
+    return AgentRow(
+        id=str(agent.id),
+        org_id=str(org_id),
+        name=agent.name,
+        description=agent.description,
+        owner_id=agent.owner_id,
+        scopes=[s.value for s in agent.scopes],
+        policy_ids=[str(pid) for pid in agent.policy_ids],
+        is_active=agent.is_active,
+        created_at=agent.created_at,
+        metadata_=agent.metadata,
     )
 
 
 def _row_to_agent(row: AgentRow) -> Agent:
-    """Convert an ORM AgentRow to a Pydantic Agent."""
     return Agent(
         id=UUID(row.id),
         name=row.name,
@@ -79,26 +99,11 @@ def _row_to_agent(row: AgentRow) -> Agent:
     )
 
 
-def _agent_to_row(agent: Agent) -> AgentRow:
-    """Convert a Pydantic Agent to an ORM AgentRow."""
-    return AgentRow(
-        id=str(agent.id),
-        name=agent.name,
-        description=agent.description,
-        owner_id=agent.owner_id,
-        scopes=[s.value for s in agent.scopes],
-        policy_ids=[str(pid) for pid in agent.policy_ids],
-        is_active=agent.is_active,
-        created_at=agent.created_at,
-        metadata_=agent.metadata,
-    )
-
-
-def _decision_to_row(decision: PermissionDecision) -> AuditLogRow:
-    """Convert a Pydantic PermissionDecision to an ORM AuditLogRow."""
+def _decision_to_row(decision: PermissionDecision, org_id: UUID) -> AuditLogRow:
     return AuditLogRow(
-        id=str(decision.request_id),  # reuse request_id as PK for idempotency
+        id=str(decision.request_id),
         request_id=str(decision.request_id),
+        org_id=str(org_id),
         agent_id=str(decision.agent_id),
         action=decision.permission.action,
         resource=decision.permission.resource,
@@ -113,7 +118,6 @@ def _decision_to_row(decision: PermissionDecision) -> AuditLogRow:
 
 
 def _row_to_decision(row: AuditLogRow) -> PermissionDecision:
-    """Convert an ORM AuditLogRow back to a Pydantic PermissionDecision."""
     return PermissionDecision(
         request_id=UUID(row.request_id),
         agent_id=UUID(row.agent_id),
@@ -131,197 +135,132 @@ def _row_to_decision(row: AuditLogRow) -> PermissionDecision:
     )
 
 
-# ── DB-backed PolicyStore ──────────────────────────────────────────────────────
+# ── DBPolicyStore (org-scoped) ────────────────────────────────────────────────
 
 
 class DBPolicyStore:
-    """
-    Async database-backed policy store.
-
-    Each method accepts an AsyncSession injected via FastAPI's Depends(get_db).
-    """
-
-    async def create(self, db: AsyncSession, policy: Policy) -> Policy:
-        """Persist a new policy and return it."""
-        row = _policy_to_row(policy)
+    async def create(self, db: AsyncSession, policy: Policy, org_id: UUID) -> Policy:
+        row = _policy_to_row(policy, org_id)
         db.add(row)
-        await db.flush()  # assigns DB-generated defaults without full commit
-        logger.info("Policy created", policy_id=str(policy.id), name=policy.name)
+        await db.flush()
+        logger.info("Policy created", policy_id=str(policy.id), org_id=str(org_id), name=policy.name)
         return policy
 
-    async def get(self, db: AsyncSession, policy_id: UUID) -> Policy | None:
-        """Fetch a policy by ID, or None if not found."""
-        result = await db.execute(
-            select(PolicyRow).where(PolicyRow.id == str(policy_id))
-        )
+    async def get(self, db: AsyncSession, policy_id: UUID, org_id: UUID | None = None) -> Policy | None:
+        stmt = select(PolicyRow).where(PolicyRow.id == str(policy_id))
+        if org_id is not None:
+            stmt = stmt.where(PolicyRow.org_id == str(org_id))
+        result = await db.execute(stmt)
         row = result.scalar_one_or_none()
         return _row_to_policy(row) if row else None
 
-    async def get_many(self, db: AsyncSession, policy_ids: list[UUID]) -> list[Policy]:
-        """Fetch multiple policies by ID, skipping missing ones."""
+    async def get_many(self, db: AsyncSession, policy_ids: list[UUID], org_id: UUID | None = None) -> list[Policy]:
         if not policy_ids:
             return []
         str_ids = [str(pid) for pid in policy_ids]
+        stmt = select(PolicyRow).where(PolicyRow.id.in_(str_ids))
+        if org_id is not None:
+            stmt = stmt.where(PolicyRow.org_id == str(org_id))
+        result = await db.execute(stmt)
+        return [_row_to_policy(row) for row in result.scalars().all()]
+
+    async def list_all(self, db: AsyncSession, org_id: UUID) -> list[Policy]:
         result = await db.execute(
-            select(PolicyRow).where(PolicyRow.id.in_(str_ids))
+            select(PolicyRow)
+            .where(PolicyRow.org_id == str(org_id))
+            .order_by(PolicyRow.created_at.asc())
         )
         return [_row_to_policy(row) for row in result.scalars().all()]
 
-    async def list_all(self, db: AsyncSession) -> list[Policy]:
-        """Return all policies ordered by creation time."""
-        result = await db.execute(
-            select(PolicyRow).order_by(PolicyRow.created_at.asc())
-        )
-        return [_row_to_policy(row) for row in result.scalars().all()]
-
-    async def delete(self, db: AsyncSession, policy_id: UUID) -> bool:
-        """Delete a policy. Returns True if deleted, False if not found."""
-        result = await db.execute(
-            delete(PolicyRow).where(PolicyRow.id == str(policy_id))
-        )
-        deleted = result.rowcount > 0
-        if deleted:
-            logger.info("Policy deleted", policy_id=str(policy_id))
-        return deleted
+    async def delete(self, db: AsyncSession, policy_id: UUID, org_id: UUID | None = None) -> bool:
+        stmt = delete(PolicyRow).where(PolicyRow.id == str(policy_id))
+        if org_id is not None:
+            stmt = stmt.where(PolicyRow.org_id == str(org_id))
+        result = await db.execute(stmt)
+        return result.rowcount > 0
 
 
-# ── DB-backed AgentStore ───────────────────────────────────────────────────────
+# ── DBAgentStore (org-scoped) ─────────────────────────────────────────────────
 
 
 class DBAgentStore:
-    """
-    Async database-backed agent store.
-    """
-
-    async def register(self, db: AsyncSession, agent: Agent) -> Agent:
-        """Persist a new agent and return it."""
-        row = _agent_to_row(agent)
+    async def register(self, db: AsyncSession, agent: Agent, org_id: UUID) -> Agent:
+        row = _agent_to_row(agent, org_id)
         db.add(row)
         await db.flush()
-        logger.info("Agent registered", agent_id=str(agent.id), name=agent.name)
+        logger.info("Agent registered", agent_id=str(agent.id), org_id=str(org_id), name=agent.name)
         return agent
 
-    async def get(self, db: AsyncSession, agent_id: UUID) -> Agent | None:
-        """Fetch an agent by ID, or None if not found."""
-        result = await db.execute(
-            select(AgentRow).where(AgentRow.id == str(agent_id))
-        )
+    async def get(self, db: AsyncSession, agent_id: UUID, org_id: UUID | None = None) -> Agent | None:
+        stmt = select(AgentRow).where(AgentRow.id == str(agent_id))
+        if org_id is not None:
+            stmt = stmt.where(AgentRow.org_id == str(org_id))
+        result = await db.execute(stmt)
         row = result.scalar_one_or_none()
         return _row_to_agent(row) if row else None
 
-    async def get_by_name(
-        self, db: AsyncSession, name: str, owner_id: str
-    ) -> Agent | None:
-        """Fetch an agent by name + owner, or None if not found."""
-        result = await db.execute(
-            select(AgentRow).where(
-                AgentRow.name == name, AgentRow.owner_id == owner_id
-            )
-        )
-        row = result.scalar_one_or_none()
-        return _row_to_agent(row) if row else None
-
-    async def list_by_owner(self, db: AsyncSession, owner_id: str) -> list[Agent]:
-        """Return all agents for a given owner."""
+    async def list_by_owner(self, db: AsyncSession, owner_id: str, org_id: UUID) -> list[Agent]:
         result = await db.execute(
             select(AgentRow)
-            .where(AgentRow.owner_id == owner_id)
+            .where(AgentRow.owner_id == owner_id, AgentRow.org_id == str(org_id))
             .order_by(AgentRow.created_at.asc())
         )
         return [_row_to_agent(row) for row in result.scalars().all()]
 
-    async def deactivate(self, db: AsyncSession, agent_id: UUID) -> bool:
-        """Deactivate an agent. Returns True if found and updated."""
-        result = await db.execute(
-            update(AgentRow)
-            .where(AgentRow.id == str(agent_id))
-            .values(is_active=False)
-        )
-        updated = result.rowcount > 0
-        if updated:
-            logger.info("Agent deactivated", agent_id=str(agent_id))
-        return updated
+    async def deactivate(self, db: AsyncSession, agent_id: UUID, org_id: UUID | None = None) -> bool:
+        stmt = update(AgentRow).where(AgentRow.id == str(agent_id)).values(is_active=False)
+        if org_id is not None:
+            stmt = stmt.where(AgentRow.org_id == str(org_id))
+        result = await db.execute(stmt)
+        return result.rowcount > 0
 
-    async def delete(self, db: AsyncSession, agent_id: UUID) -> bool:
-        """Delete an agent. Returns True if deleted, False if not found."""
-        result = await db.execute(
-            delete(AgentRow).where(AgentRow.id == str(agent_id))
-        )
-        deleted = result.rowcount > 0
-        if deleted:
-            logger.info("Agent deleted", agent_id=str(agent_id))
-        return deleted
+    async def delete(self, db: AsyncSession, agent_id: UUID, org_id: UUID | None = None) -> bool:
+        stmt = delete(AgentRow).where(AgentRow.id == str(agent_id))
+        if org_id is not None:
+            stmt = stmt.where(AgentRow.org_id == str(org_id))
+        result = await db.execute(stmt)
+        return result.rowcount > 0
 
 
-# ── DB-backed AuditLogStore ────────────────────────────────────────────────────
+# ── DBAuditLogStore (org-scoped) ──────────────────────────────────────────────
 
 
 class DBAuditLogStore:
-    """
-    Async database-backed audit log store.
-    Writes every PermissionDecision and supports querying by agent.
-    """
-
-    async def record(
-        self, db: AsyncSession, decision: PermissionDecision
-    ) -> None:
-        """Persist a PermissionDecision to the audit log."""
-        row = _decision_to_row(decision)
+    async def record(self, db: AsyncSession, decision: PermissionDecision, org_id: UUID) -> None:
+        row = _decision_to_row(decision, org_id)
         db.add(row)
         await db.flush()
         logger.debug(
             "Audit log entry recorded",
             request_id=str(decision.request_id),
+            org_id=str(org_id),
             agent_id=str(decision.agent_id),
             result=decision.result.value,
         )
 
     async def list_for_agent(
-        self,
-        db: AsyncSession,
-        agent_id: UUID,
-        limit: int = 100,
-        offset: int = 0,
+        self, db: AsyncSession, agent_id: UUID, org_id: UUID | None = None,
+        limit: int = 100, offset: int = 0,
     ) -> list[PermissionDecision]:
-        """
-        Return the most recent decisions for a given agent.
-
-        Args:
-            agent_id: Filter by agent.
-            limit:    Maximum rows to return (default 100, max enforced by caller).
-            offset:   Pagination offset.
-        """
-        result = await db.execute(
-            select(AuditLogRow)
-            .where(AuditLogRow.agent_id == str(agent_id))
-            .order_by(AuditLogRow.evaluated_at.desc())
-            .limit(limit)
-            .offset(offset)
-        )
+        stmt = select(AuditLogRow).where(AuditLogRow.agent_id == str(agent_id))
+        if org_id is not None:
+            stmt = stmt.where(AuditLogRow.org_id == str(org_id))
+        stmt = stmt.order_by(AuditLogRow.evaluated_at.desc()).limit(limit).offset(offset)
+        result = await db.execute(stmt)
         return [_row_to_decision(row) for row in result.scalars().all()]
 
-    async def count_for_agent(self, db: AsyncSession, agent_id: UUID) -> int:
-        """Return the total number of audit log entries for an agent."""
-        from sqlalchemy import func
-        result = await db.execute(
-            select(func.count()).where(AuditLogRow.agent_id == str(agent_id))
-        )
+    async def count_for_agent(self, db: AsyncSession, agent_id: UUID, org_id: UUID | None = None) -> int:
+        stmt = select(func.count()).where(AuditLogRow.agent_id == str(agent_id))
+        if org_id is not None:
+            stmt = stmt.where(AuditLogRow.org_id == str(org_id))
+        result = await db.execute(stmt)
         return result.scalar_one()
 
 
-# ── Module-level singletons ───────────────────────────────────────────────────
-# Instantiated once; all state is in the DB, not in these objects.
-
-agent_store = DBAgentStore()
-policy_store = DBPolicyStore()
-audit_log_store = DBAuditLogStore()
-
-
-# ── DB-backed WebhookStore ─────────────────────────────────────────────────────
+# ── DBWebhookStore (org-scoped) ───────────────────────────────────────────────
 
 
 def _row_to_webhook(row: WebhookRow) -> Webhook:
-    """Convert an ORM WebhookRow to a Pydantic Webhook."""
     return Webhook(
         id=UUID(row.id),
         agent_id=UUID(row.agent_id),
@@ -334,7 +273,6 @@ def _row_to_webhook(row: WebhookRow) -> Webhook:
 
 
 def _row_to_delivery(row: WebhookDeliveryRow) -> WebhookDelivery:
-    """Convert an ORM WebhookDeliveryRow to a Pydantic WebhookDelivery."""
     return WebhookDelivery(
         id=UUID(row.id),
         webhook_id=UUID(row.webhook_id),
@@ -349,18 +287,10 @@ def _row_to_delivery(row: WebhookDeliveryRow) -> WebhookDelivery:
 
 
 class DBWebhookStore:
-    """
-    Async database-backed webhook store.
-
-    Handles webhook registration CRUD and delivery log persistence.
-    """
-
-    # ── Webhook CRUD ───────────────────────────────────────────────────────────
-
-    async def create(self, db: AsyncSession, webhook: Webhook) -> Webhook:
-        """Persist a new webhook registration."""
+    async def create(self, db: AsyncSession, webhook: Webhook, org_id: UUID) -> Webhook:
         row = WebhookRow(
             id=str(webhook.id),
+            org_id=str(org_id),
             agent_id=str(webhook.agent_id),
             url=webhook.url,
             events=[e.value for e in webhook.events],
@@ -373,65 +303,41 @@ class DBWebhookStore:
         logger.info(
             "Webhook registered",
             webhook_id=str(webhook.id),
+            org_id=str(org_id),
             agent_id=str(webhook.agent_id),
             url=webhook.url,
-            events=[e.value for e in webhook.events],
         )
         return webhook
 
-    async def get(self, db: AsyncSession, webhook_id: UUID) -> Webhook | None:
-        """Fetch a webhook by ID, or None if not found."""
-        result = await db.execute(
-            select(WebhookRow).where(WebhookRow.id == str(webhook_id))
-        )
+    async def get(self, db: AsyncSession, webhook_id: UUID, org_id: UUID | None = None) -> Webhook | None:
+        stmt = select(WebhookRow).where(WebhookRow.id == str(webhook_id))
+        if org_id is not None:
+            stmt = stmt.where(WebhookRow.org_id == str(org_id))
+        result = await db.execute(stmt)
         row = result.scalar_one_or_none()
         return _row_to_webhook(row) if row else None
 
     async def list_for_agent(
-        self, db: AsyncSession, agent_id: UUID, active_only: bool = False
+        self, db: AsyncSession, agent_id: UUID, org_id: UUID | None = None,
+        active_only: bool = False,
     ) -> list[Webhook]:
-        """Return all webhooks for an agent, optionally filtering to active only."""
         stmt = select(WebhookRow).where(WebhookRow.agent_id == str(agent_id))
+        if org_id is not None:
+            stmt = stmt.where(WebhookRow.org_id == str(org_id))
         if active_only:
             stmt = stmt.where(WebhookRow.is_active == True)  # noqa: E712
         stmt = stmt.order_by(WebhookRow.created_at.asc())
         result = await db.execute(stmt)
         return [_row_to_webhook(row) for row in result.scalars().all()]
 
-    async def deactivate(self, db: AsyncSession, webhook_id: UUID) -> bool:
-        """
-        Soft-delete a webhook by marking it inactive.
-        Returns True if found, False otherwise.
-        """
-        result = await db.execute(
-            update(WebhookRow)
-            .where(WebhookRow.id == str(webhook_id))
-            .values(is_active=False)
-        )
-        deleted = result.rowcount > 0
-        if deleted:
-            logger.info("Webhook deactivated", webhook_id=str(webhook_id))
-        return deleted
+    async def hard_delete(self, db: AsyncSession, webhook_id: UUID, org_id: UUID | None = None) -> bool:
+        stmt = delete(WebhookRow).where(WebhookRow.id == str(webhook_id))
+        if org_id is not None:
+            stmt = stmt.where(WebhookRow.org_id == str(org_id))
+        result = await db.execute(stmt)
+        return result.rowcount > 0
 
-    async def hard_delete(self, db: AsyncSession, webhook_id: UUID) -> bool:
-        """
-        Permanently delete a webhook and its delivery history.
-        Returns True if deleted, False if not found.
-        """
-        result = await db.execute(
-            delete(WebhookRow).where(WebhookRow.id == str(webhook_id))
-        )
-        deleted = result.rowcount > 0
-        if deleted:
-            logger.info("Webhook deleted", webhook_id=str(webhook_id))
-        return deleted
-
-    # ── Delivery log ───────────────────────────────────────────────────────────
-
-    async def record_delivery(
-        self, db: AsyncSession, delivery: WebhookDelivery
-    ) -> None:
-        """Persist a delivery attempt to the log."""
+    async def record_delivery(self, db: AsyncSession, delivery: WebhookDelivery) -> None:
         row = WebhookDeliveryRow(
             id=str(delivery.id),
             webhook_id=str(delivery.webhook_id),
@@ -445,22 +351,11 @@ class DBWebhookStore:
         )
         db.add(row)
         await db.flush()
-        logger.debug(
-            "Webhook delivery recorded",
-            webhook_id=str(delivery.webhook_id),
-            request_id=str(delivery.request_id),
-            attempt=delivery.attempt,
-            success=delivery.success,
-        )
 
     async def list_deliveries(
-        self,
-        db: AsyncSession,
-        webhook_id: UUID,
-        limit: int = 50,
-        offset: int = 0,
+        self, db: AsyncSession, webhook_id: UUID,
+        limit: int = 50, offset: int = 0,
     ) -> list[WebhookDelivery]:
-        """Return delivery history for a webhook, most recent first."""
         result = await db.execute(
             select(WebhookDeliveryRow)
             .where(WebhookDeliveryRow.webhook_id == str(webhook_id))
@@ -471,15 +366,161 @@ class DBWebhookStore:
         return [_row_to_delivery(row) for row in result.scalars().all()]
 
     async def count_deliveries(self, db: AsyncSession, webhook_id: UUID) -> int:
-        """Return total number of delivery attempts for a webhook."""
-        from sqlalchemy import func
         result = await db.execute(
-            select(func.count()).where(
-                WebhookDeliveryRow.webhook_id == str(webhook_id)
-            )
+            select(func.count()).where(WebhookDeliveryRow.webhook_id == str(webhook_id))
         )
         return result.scalar_one()
 
 
-# Add singleton to module exports
+# ── DBOrganizationStore ───────────────────────────────────────────────────────
+
+
+def _row_to_org(row: OrganizationRow) -> Organization:
+    return Organization(
+        id=UUID(row.id),
+        name=row.name,
+        slug=row.slug,
+        description=row.description,
+        owner_id=row.owner_id,
+        is_active=row.is_active,
+        created_at=row.created_at,
+        metadata=row.metadata_,
+    )
+
+
+class DBOrganizationStore:
+    async def create(self, db: AsyncSession, org: Organization) -> Organization:
+        row = OrganizationRow(
+            id=str(org.id),
+            name=org.name,
+            slug=org.slug,
+            description=org.description,
+            owner_id=org.owner_id,
+            is_active=org.is_active,
+            created_at=org.created_at,
+            metadata_=org.metadata,
+        )
+        db.add(row)
+        await db.flush()
+        logger.info("Organization created", org_id=str(org.id), name=org.name, slug=org.slug)
+        return org
+
+    async def get(self, db: AsyncSession, org_id: UUID) -> Organization | None:
+        result = await db.execute(
+            select(OrganizationRow).where(OrganizationRow.id == str(org_id))
+        )
+        row = result.scalar_one_or_none()
+        return _row_to_org(row) if row else None
+
+    async def get_by_slug(self, db: AsyncSession, slug: str) -> Organization | None:
+        result = await db.execute(
+            select(OrganizationRow).where(OrganizationRow.slug == slug.lower())
+        )
+        row = result.scalar_one_or_none()
+        return _row_to_org(row) if row else None
+
+    async def slug_exists(self, db: AsyncSession, slug: str) -> bool:
+        result = await db.execute(
+            select(OrganizationRow.id).where(OrganizationRow.slug == slug.lower())
+        )
+        return result.scalar_one_or_none() is not None
+
+    async def list_by_owner(self, db: AsyncSession, owner_id: str) -> list[Organization]:
+        result = await db.execute(
+            select(OrganizationRow)
+            .where(OrganizationRow.owner_id == owner_id)
+            .order_by(OrganizationRow.created_at.asc())
+        )
+        return [_row_to_org(row) for row in result.scalars().all()]
+
+    async def deactivate(self, db: AsyncSession, org_id: UUID) -> bool:
+        result = await db.execute(
+            update(OrganizationRow)
+            .where(OrganizationRow.id == str(org_id))
+            .values(is_active=False)
+        )
+        return result.rowcount > 0
+
+
+# ── DBOrgApiKeyStore ──────────────────────────────────────────────────────────
+
+
+def _row_to_api_key(row: OrgApiKeyRow) -> OrgApiKey:
+    return OrgApiKey(
+        id=UUID(row.id),
+        org_id=UUID(row.org_id),
+        name=row.name,
+        key_prefix=row.key_prefix,
+        is_active=row.is_active,
+        last_used_at=row.last_used_at,
+        created_at=row.created_at,
+    )
+
+
+class DBOrgApiKeyStore:
+    async def create(self, db: AsyncSession, api_key: OrgApiKey, key_hash: str) -> OrgApiKey:
+        row = OrgApiKeyRow(
+            id=str(api_key.id),
+            org_id=str(api_key.org_id),
+            name=api_key.name,
+            key_prefix=api_key.key_prefix,
+            key_hash=key_hash,
+            is_active=api_key.is_active,
+            created_at=api_key.created_at,
+        )
+        db.add(row)
+        await db.flush()
+        logger.info(
+            "Org API key created",
+            key_id=str(api_key.id), org_id=str(api_key.org_id),
+            name=api_key.name, prefix=api_key.key_prefix,
+        )
+        return api_key
+
+    async def get_by_prefix_and_hash(
+        self, db: AsyncSession, key_prefix: str, key_hash: str
+    ) -> tuple[OrgApiKey, UUID] | None:
+        result = await db.execute(
+            select(OrgApiKeyRow).where(
+                OrgApiKeyRow.key_prefix == key_prefix,
+                OrgApiKeyRow.key_hash == key_hash,
+                OrgApiKeyRow.is_active == True,  # noqa: E712
+            )
+        )
+        row = result.scalar_one_or_none()
+        if not row:
+            return None
+        return _row_to_api_key(row), UUID(row.org_id)
+
+    async def list_for_org(self, db: AsyncSession, org_id: UUID) -> list[OrgApiKey]:
+        result = await db.execute(
+            select(OrgApiKeyRow)
+            .where(OrgApiKeyRow.org_id == str(org_id))
+            .order_by(OrgApiKeyRow.created_at.desc())
+        )
+        return [_row_to_api_key(row) for row in result.scalars().all()]
+
+    async def deactivate(self, db: AsyncSession, key_id: UUID) -> bool:
+        result = await db.execute(
+            update(OrgApiKeyRow)
+            .where(OrgApiKeyRow.id == str(key_id))
+            .values(is_active=False)
+        )
+        return result.rowcount > 0
+
+    async def update_last_used(self, db: AsyncSession, key_id: UUID) -> None:
+        await db.execute(
+            update(OrgApiKeyRow)
+            .where(OrgApiKeyRow.id == str(key_id))
+            .values(last_used_at=datetime.utcnow())
+        )
+
+
+# ── Module-level singletons ───────────────────────────────────────────────────
+
+agent_store = DBAgentStore()
+policy_store = DBPolicyStore()
+audit_log_store = DBAuditLogStore()
 webhook_store = DBWebhookStore()
+organization_store = DBOrganizationStore()
+org_api_key_store = DBOrgApiKeyStore()

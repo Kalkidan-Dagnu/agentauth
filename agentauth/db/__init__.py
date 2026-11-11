@@ -9,6 +9,8 @@ from agentauth.db.models import (
     AgentRow,
     AuditLogRow,
     Base,
+    OrganizationRow,
+    OrgApiKeyRow,
     PolicyRow,
     WebhookDeliveryRow,
     WebhookRow,
@@ -22,6 +24,8 @@ __all__ = [
     "AuditLogRow",
     "WebhookRow",
     "WebhookDeliveryRow",
+    "OrganizationRow",
+    "OrgApiKeyRow",
     "init_db",
     "get_db",
 ]
