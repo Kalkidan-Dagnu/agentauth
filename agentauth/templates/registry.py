@@ -42,6 +42,13 @@ class PolicyTemplate(str, Enum):
     NBE_MOBILE_BANKING     = "nbe_mobile_banking"
     NBE_INSURANCE_AGENT    = "nbe_insurance_agent"
 
+    # ── Central Bank of Nigeria (CBN) ─────────────────────────────────────────
+    CBN_PAYMENT_AGENT      = "cbn_payment_agent"
+    CBN_LENDING_AGENT      = "cbn_lending_agent"
+    CBN_KYC_AGENT          = "cbn_kyc_aml_agent"
+    CBN_MOBILE_MONEY       = "cbn_mobile_money"
+    CBN_INSURANCE_AGENT    = "cbn_insurance_agent"
+
 
 @dataclass
 class TemplateDefinition:
@@ -193,4 +200,5 @@ registry = TemplateRegistry()
 
 # Import provider modules to trigger registration
 # (must come after registry is defined)
+from agentauth.templates import cbn  # noqa: E402, F401
 from agentauth.templates import nbe  # noqa: E402, F401
