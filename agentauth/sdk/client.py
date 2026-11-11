@@ -133,6 +133,98 @@ class PoliciesResource:
         response.raise_for_status()
         return [Policy(**p) for p in response.json()]
 
+    def create_from_template(
+        self,
+        template_name: str,
+        policy_name: str,
+        description: str = "",
+        overrides: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> Policy:
+        """
+        Create a policy from a pre-built NBE regulatory template.
+
+        Templates provide a production-ready, NBE-compliant rule set as the
+        base. Use ``overrides`` to append additional rules specific to your
+        deployment without losing the regulatory baseline.
+
+        Args:
+            template_name: Template identifier, e.g. ``"nbe_payment_agent"``.
+                           Call ``client.policies.list_templates()`` to see
+                           all available templates.
+            policy_name:   Name for the resulting policy.
+            description:   Optional description. Defaults to the template
+                           description if not provided.
+            overrides:     Additional rules appended after the template's
+                           base rules.
+            metadata:      Extra key-value metadata stored on the policy.
+
+        Returns:
+            The created Policy with the template's rules (plus any overrides).
+
+        Example::
+
+            policy = client.policies.create_from_template(
+                template_name="nbe_payment_agent",
+                policy_name="telebirr-payment-policy",
+                overrides=[
+                    "Agent may not process payments above ETB 10,000 "
+                    "without supervisor approval"
+                ],
+            )
+        """
+        response = self._http.post(
+            "/policies/from-template",
+            json={
+                "template_name": template_name,
+                "policy_name": policy_name,
+                "description": description,
+                "overrides": overrides or [],
+                "metadata": metadata or {},
+            },
+        )
+        response.raise_for_status()
+        return Policy(**response.json())
+
+    def list_templates(
+        self,
+        regulator: str | None = None,
+        tag: str | None = None,
+    ) -> list[dict]:
+        """
+        List all available policy templates.
+
+        Args:
+            regulator: Filter by regulator, e.g. ``"NBE"``.
+            tag:       Filter by topic tag, e.g. ``"payment"``.
+
+        Returns:
+            List of template metadata dicts (name, display_name, description,
+            rules, references, etc.).
+        """
+        params: dict[str, str] = {}
+        if regulator:
+            params["regulator"] = regulator
+        if tag:
+            params["tag"] = tag
+        response = self._http.get("/templates", params=params)
+        response.raise_for_status()
+        return response.json()
+
+    def get_template(self, template_name: str) -> dict:
+        """
+        Get a single policy template by name.
+
+        Args:
+            template_name: e.g. ``"nbe_mobile_banking"``
+
+        Returns:
+            Template metadata dict including the full rule set.
+        """
+        response = self._http.get(f"/templates/{template_name}")
+        response.raise_for_status()
+        return response.json()
+
 
 class PermissionsResource:
     """SDK resource for evaluating permissions."""
