@@ -1,0 +1,17 @@
+/home/kal/Documents/Projects/Kibrnet/agentauth/sdk-java/src/main/java/io/agentauth/sdk/client/AgentAuthClient.java
+/home/kal/Documents/Projects/Kibrnet/agentauth/sdk-java/src/main/java/io/agentauth/sdk/client/AgentsResource.java
+/home/kal/Documents/Projects/Kibrnet/agentauth/sdk-java/src/main/java/io/agentauth/sdk/client/HttpHelper.java
+/home/kal/Documents/Projects/Kibrnet/agentauth/sdk-java/src/main/java/io/agentauth/sdk/client/PermissionsResource.java
+/home/kal/Documents/Projects/Kibrnet/agentauth/sdk-java/src/main/java/io/agentauth/sdk/client/PoliciesResource.java
+/home/kal/Documents/Projects/Kibrnet/agentauth/sdk-java/src/main/java/io/agentauth/sdk/client/TemplateResource.java
+/home/kal/Documents/Projects/Kibrnet/agentauth/sdk-java/src/main/java/io/agentauth/sdk/client/WebhookResource.java
+/home/kal/Documents/Projects/Kibrnet/agentauth/sdk-java/src/main/java/io/agentauth/sdk/model/Agent.java
+/home/kal/Documents/Projects/Kibrnet/agentauth/sdk-java/src/main/java/io/agentauth/sdk/model/AgentScope.java
+/home/kal/Documents/Projects/Kibrnet/agentauth/sdk-java/src/main/java/io/agentauth/sdk/model/ConfidenceLevel.java
+/home/kal/Documents/Projects/Kibrnet/agentauth/sdk-java/src/main/java/io/agentauth/sdk/model/DecisionResult.java
+/home/kal/Documents/Projects/Kibrnet/agentauth/sdk-java/src/main/java/io/agentauth/sdk/model/Organization.java
+/home/kal/Documents/Projects/Kibrnet/agentauth/sdk-java/src/main/java/io/agentauth/sdk/model/Permission.java
+/home/kal/Documents/Projects/Kibrnet/agentauth/sdk-java/src/main/java/io/agentauth/sdk/model/PermissionDecision.java
+/home/kal/Documents/Projects/Kibrnet/agentauth/sdk-java/src/main/java/io/agentauth/sdk/model/Policy.java
+/home/kal/Documents/Projects/Kibrnet/agentauth/sdk-java/src/main/java/io/agentauth/sdk/model/TemplateInfo.java
+/home/kal/Documents/Projects/Kibrnet/agentauth/sdk-java/src/main/java/io/agentauth/sdk/model/Webhook.java
