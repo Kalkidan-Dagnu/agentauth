@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agentauth"
-version = "0.2.0"
+version = "0.8.0"
 description = "Open-source identity and authentication layer for AI agents, powered by Google Gemini"
 readme = "README.md"
 license = { text = "MIT" }
@@ -49,6 +49,15 @@ dev = [
     "ruff==0.8.4",
     "mypy==1.13.0",
     "aiosqlite==0.20.0",
+]
+gemma = [
+    # Core inference stack
+    "transformers>=4.47.0",
+    "torch>=2.5.0",
+    "accelerate>=1.2.0",
+    # Optional: 4-bit / 8-bit quantisation (reduces RAM/VRAM by ~50%)
+    # Install manually if needed: pip install bitsandbytes
+    # "bitsandbytes>=0.45.0",
 ]
 
 [project.urls]

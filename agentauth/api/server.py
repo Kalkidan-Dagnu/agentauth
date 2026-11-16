@@ -1,13 +1,11 @@
 """
-AgentAuth REST API Server — v0.5.0
+AgentAuth REST API Server — v0.8.0
 
-Changes from v0.4.0:
-  - POST /orgs                         — create an organisation
-  - GET  /orgs/{id}                     — get org details
-  - POST /orgs/{id}/api-keys            — issue an org API key
-  - GET  /orgs/{id}/api-keys            — list org API keys
-  - All existing endpoints (agents, policies, webhooks, audit, templates)
-    are now scoped to the caller's organisation via X-API-Key header
+Changes from v0.5.0:
+  - Supports two reasoning backends via REASONING_BACKEND env var:
+      REASONING_BACKEND=gemini  (default) — uses Google Gemini API
+      REASONING_BACKEND=gemma            — uses local Gemma model (offline)
+  - New env vars: GEMMA_MODEL_ID, GEMMA_MODEL_PATH, GEMMA_LOAD_IN_4BIT
 """
 
 from __future__ import annotations
@@ -25,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from agentauth.api.auth import get_token_agent_id, issue_token
 from agentauth.api.tenancy import get_current_org, issue_api_key
+from agentauth.core.base_engine import BaseEngine
 from agentauth.core.engine import AgentAuthEngine
 from agentauth.core.models import (
     Agent,
@@ -54,24 +53,72 @@ from agentauth.webhooks.dispatcher import dispatch_webhooks
 
 logger = structlog.get_logger(__name__)
 
-_engine: AgentAuthEngine | None = None
+_engine: BaseEngine | None = None
+
+
+def _build_engine() -> BaseEngine:
+    """
+    Instantiate the reasoning backend based on REASONING_BACKEND env var.
+
+    REASONING_BACKEND=gemini (default):
+        Requires GEMINI_API_KEY. Uses Google Gemini API.
+
+    REASONING_BACKEND=gemma:
+        Uses a local Gemma model via HuggingFace transformers.
+        Requires transformers + torch (pip install agentauth[gemma]).
+        Configure with GEMMA_MODEL_ID or GEMMA_MODEL_PATH.
+        Optionally set GEMMA_LOAD_IN_4BIT=true for quantised inference.
+    """
+    backend = os.getenv("REASONING_BACKEND", "gemini").lower().strip()
+
+    if backend == "gemma":
+        from agentauth.core.gemma_engine import GemmaEngine
+        model_id = os.getenv("GEMMA_MODEL_ID")
+        model_path = os.getenv("GEMMA_MODEL_PATH")
+        load_in_4bit = os.getenv("GEMMA_LOAD_IN_4BIT", "false").lower() == "true"
+        load_in_8bit = os.getenv("GEMMA_LOAD_IN_8BIT", "false").lower() == "true"
+
+        logger.info(
+            "Starting with Gemma backend",
+            model_id=model_id,
+            model_path=model_path,
+            load_in_4bit=load_in_4bit,
+        )
+        return GemmaEngine(
+            model_id=model_id,
+            model_path=model_path,
+            load_in_4bit=load_in_4bit,
+            load_in_8bit=load_in_8bit,
+        )
+
+    # Default: Gemini
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "GEMINI_API_KEY environment variable is required when REASONING_BACKEND=gemini (default). "
+            "Set REASONING_BACKEND=gemma to use a local model instead."
+        )
+    model = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+    logger.info("Starting with Gemini backend", model=model)
+    return AgentAuthEngine(api_key=api_key, model=model)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _engine
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        raise RuntimeError("GEMINI_API_KEY environment variable is required")
-    model = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
-    _engine = AgentAuthEngine(api_key=api_key, model=model)
+
+    _engine = _build_engine()
 
     database_url = os.getenv("DATABASE_URL")
     if not database_url:
         raise RuntimeError("DATABASE_URL environment variable is required")
     await init_db(database_url)
 
-    logger.info("AgentAuth server started", model=model, version="0.5.0")
+    logger.info(
+        "AgentAuth server started",
+        backend=_engine.backend_name,
+        version="0.8.0",
+    )
     yield
     await close_db()
     logger.info("AgentAuth server shutting down")
@@ -83,7 +130,7 @@ app = FastAPI(
         "Open-source identity and authentication layer for AI agents. "
         "Powered by Google Gemini. Built by Kibrnet PLC, Addis Ababa, Ethiopia."
     ),
-    version="0.5.0",
+    version="0.8.0",
     lifespan=lifespan,
     docs_url="/docs",
     redoc_url="/redoc",
@@ -170,7 +217,7 @@ class CreatePolicyFromTemplateRequest(BaseModel):
 
 @app.get("/health", tags=["System"])
 async def health_check() -> dict[str, str]:
-    return {"status": "healthy", "version": "0.5.0"}
+    return {"status": "healthy", "version": "0.8.0"}
 
 
 # ── Organisations (no auth — creation is open) ────────────────────────────────
