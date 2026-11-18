@@ -48,9 +48,15 @@ async def init_db(database_url: str) -> None:
     global _engine, _session_factory
 
     # connect_args only needed for SQLite (disable same-thread check)
+    # For asyncpg connecting to Neon/external Postgres, ssl=True is required
     connect_args: dict = {}
     if database_url.startswith("sqlite"):
         connect_args["check_same_thread"] = False
+    elif "asyncpg" in database_url and not database_url.startswith("sqlite"):
+        # asyncpg requires ssl passed as a connect_arg, not a query string param
+        # This handles Neon, Supabase, and any SSL-required Postgres host
+        import ssl as ssl_module
+        connect_args["ssl"] = ssl_module.create_default_context()
 
     _engine = create_async_engine(
         database_url,

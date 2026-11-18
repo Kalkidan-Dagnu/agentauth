@@ -15,8 +15,8 @@ RUN pip install --no-cache-dir -e ".[dev]"
 # Copy application code
 COPY . .
 
-# Run Alembic migrations then start the server
-CMD alembic upgrade head && uvicorn agentauth.api.server:app \
-    --host 0.0.0.0 \
-    --port 8080 \
-    --workers 1
+# Start script: run migrations then start server
+COPY start.sh /start.sh
+RUN chmod +x /start.sh
+
+CMD ["/start.sh"]
