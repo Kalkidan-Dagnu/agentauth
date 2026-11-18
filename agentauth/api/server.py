@@ -16,7 +16,7 @@ from typing import Any
 from uuid import UUID
 
 import structlog
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, status
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -571,6 +571,7 @@ async def list_webhooks(
 @app.delete(
     "/webhooks/{webhook_id}",
     status_code=status.HTTP_204_NO_CONTENT,
+    response_class=Response,
     tags=["Webhooks"],
     summary="Delete a webhook",
 )
