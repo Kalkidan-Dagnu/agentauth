@@ -39,14 +39,7 @@ config = context.config
 # Override sqlalchemy.url from environment variable
 database_url = os.getenv("DATABASE_URL")
 if database_url:
-    # Alembic uses a sync driver for migrations.
-    # If DATABASE_URL uses asyncpg (app default), swap to psycopg2 for Alembic.
-    sync_url = (
-        database_url
-        .replace("postgresql+asyncpg://", "postgresql://")
-        .replace("postgres+asyncpg://", "postgresql://")
-    )
-    config.set_main_option("sqlalchemy.url", sync_url)
+    config.set_main_option("sqlalchemy.url", database_url)
 
 # Set up loggers from alembic.ini
 if config.config_file_name is not None:
