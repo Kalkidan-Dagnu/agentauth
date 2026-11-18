@@ -16,7 +16,7 @@ from typing import Any
 from uuid import UUID
 
 import structlog
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Response, status
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -570,8 +570,7 @@ async def list_webhooks(
 
 @app.delete(
     "/webhooks/{webhook_id}",
-    status_code=status.HTTP_204_NO_CONTENT,
-    response_class=Response,
+    status_code=status.HTTP_200_OK,
     tags=["Webhooks"],
     summary="Delete a webhook",
 )
@@ -579,11 +578,12 @@ async def delete_webhook(
     webhook_id: UUID,
     org: Organization = Depends(get_current_org),
     db: AsyncSession = Depends(get_db),
-) -> None:
+) -> dict:
     """Permanently delete a webhook (must belong to the caller's org)."""
     deleted = await webhook_store.hard_delete(db, webhook_id, org_id=org.id)
     if not deleted:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Webhook not found")
+    return {"deleted": True}
 
 
 @app.get(
