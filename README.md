@@ -4,10 +4,11 @@
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
 [![Java](https://img.shields.io/badge/Java-17%2B-orange)](https://openjdk.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
+[![Live Demo](https://img.shields.io/badge/Live%20Demo-agentauth.fly.dev-brightgreen)](https://agentauth.fly.dev/docs)
 
 > Open-source identity and authentication layer for AI agents — powered by Google Gemini.
 
-Built by **[Kalkidan Dagnu](https://github.com/Kalkidan-Dagnu)** · [Kibrnet PLC](https://github.com/kibrnet) · Addis Ababa, Ethiopia
+**[🚀 Live Demo →](https://agentauth.fly.dev/docs)** · Built by **[Kalkidan Dagnu](https://github.com/Kalkidan-Dagnu)** · [Kibrnet PLC](https://github.com/kibrnet) · Addis Ababa, Ethiopia
 
 ---
 
