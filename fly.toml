@@ -1,0 +1,28 @@
+app = "agentauth"
+primary_region = "ams"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  AGENTAUTH_HOST = "0.0.0.0"
+  AGENTAUTH_PORT = "8080"
+  AGENTAUTH_DEBUG = "false"
+  GEMINI_MODEL = "gemini-1.5-flash"
+  REASONING_BACKEND = "gemini"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = true
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [http_service.concurrency]
+    type = "connections"
+    hard_limit = 50
+    soft_limit = 25
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
