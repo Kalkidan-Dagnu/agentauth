@@ -1,68 +1,150 @@
 # AgentAuth
 
 [![CI](https://github.com/Kalkidan-Dagnu/agentauth/actions/workflows/ci.yml/badge.svg)](https://github.com/Kalkidan-Dagnu/agentauth/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/agentauth)](https://pypi.org/project/agentauth/)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
-[![Java](https://img.shields.io/badge/Java-17%2B-orange)](https://openjdk.org/)
+[![Java](https://img.shields.io/badge/Java%20SDK-17%2B-orange)](sdk-java/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
-[![Live Demo](https://img.shields.io/badge/Live%20Demo-agentauth.fly.dev-brightgreen)](https://agentauth.fly.dev/docs)
+[![Live API](https://img.shields.io/badge/Live%20API-agentauth.fly.dev-brightgreen)](https://agentauth.fly.dev/docs)
 
-> Open-source identity and authentication layer for AI agents — powered by Google Gemini.
+**Identity and permission layer for AI agents — in plain English.**
 
-**[🚀 Live Demo →](https://agentauth.fly.dev/docs)** · Built by **[Kalkidan Dagnu](https://github.com/Kalkidan-Dagnu)** · [Kibrnet PLC](https://github.com/kibrnet) · Addis Ababa, Ethiopia
+AI agents need to be told what they're allowed to do. AgentAuth lets you define those rules in natural language, then uses an LLM reasoning engine (Google Gemini or local Gemma) to enforce them at runtime — with a full audit trail, multi-tenancy, webhooks, and Python and Java SDKs.
+
+**[→ Live API Docs](https://agentauth.fly.dev/docs)** · **[→ Python SDK](#python-sdk)** · **[→ Java SDK](sdk-java/README.md)**
 
 ---
 
-As AI agents proliferate across Africa — in fintech, health, logistics, and more — there is no authentication infrastructure designed for them. Existing tools are built for human users, expensive for African developers, and have no concept of agent-scoped permissions or dynamic policy evaluation.
-
-**AgentAuth** solves this. It lets developers define what AI agents are allowed to do in plain language, then uses Google Gemini to enforce those policies intelligently at runtime — understanding context, nuance, and edge cases that rigid rule engines miss.
+## Demo
 
 ```python
 from agentauth.sdk.client import AgentAuthClient
 
-client = AgentAuthClient(base_url="http://localhost:8000")
+client = AgentAuthClient(base_url="https://agentauth.fly.dev")
 
-# Define what your agent is allowed to do — in plain English
+# 1. Create a policy in plain English
 policy = client.policies.create(
-    name="trading-policy",
+    name="trading-limits",
     rules=[
-        "Agent may execute trades only during market hours (09:00-17:00 EAT)",
+        "Agent may execute trades only during market hours (09:00–17:00 EAT)",
         "Agent may not execute single trades above $10,000",
-        "Agent must only trade verified assets on the approved list",
+        "Agent must only trade assets on the approved list",
     ]
 )
 
-# Register your agent
+# 2. Register your agent
 agent = client.agents.register(
     name="portfolio-rebalancer",
     owner_id="user_123",
-    scopes=["execute"],
     policy_ids=[str(policy.id)],
 )
 
-# Before any action — check permission
-if client.permissions.is_allowed(agent.id, "execute_trade", "BTCUSDT", {"amount": 500}):
-    # Gemini evaluated the policy and said ALLOW
-    execute_trade(...)
+# 3. Check before every action — Gemini reasons against your policies
+decision = client.permissions.evaluate(
+    agent_id=str(agent.id),
+    action="execute_trade",
+    resource="BTCUSDT",
+    context={"amount": 15000}
+)
+
+print(decision.result)    # DENY
+print(decision.reason)    # "Trade amount of $15,000 exceeds the $10,000 limit per rule 2."
+print(decision.confidence) # HIGH
+```
+
+> **[→ Try it on the live server](https://agentauth.fly.dev/docs)**
+
+---
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        Your Application                         │
+│                                                                 │
+│   AI Agent  ──► AgentAuth SDK  ──► POST /agents/{id}/evaluate  │
+└──────────────────────────────────────┬──────────────────────────┘
+                                       │
+                                       ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                       AgentAuth Server                          │
+│                                                                 │
+│  ┌──────────────┐    ┌─────────────────┐    ┌───────────────┐  │
+│  │  API Layer   │    │ Reasoning Engine │    │  Audit Store  │  │
+│  │  (FastAPI)   │───►│                 │───►│  (PostgreSQL) │  │
+│  │  Multi-tenant│    │  BaseEngine ABC │    └───────────────┘  │
+│  │  JWT + APIKey│    │      │      │   │                        │
+│  └──────────────┘    │   Gemini  Gemma │    ┌───────────────┐  │
+│                      │  (cloud) (local)│    │   Webhooks    │  │
+│                      └─────────────────┘    │  (HMAC-signed)│  │
+│                                             └───────────────┘  │
+└─────────────────────────────────────────────────────────────────┘
+                                       │
+              ┌────────────────────────┼────────────────────────┐
+              ▼                        ▼                        ▼
+     Python SDK                  Java SDK              REST API
+  (agentauth.sdk)              (sdk-java/)        (any language)
+```
+
+**Decision flow:**
+
+```
+Agent Action  →  evaluate(action, resource, context)
+                        │
+              Load agent + policies from DB
+                        │
+              Build reasoning prompt
+                        │
+              ┌─────────▼─────────┐
+              │   Gemini / Gemma   │  ← switchable via REASONING_BACKEND env var
+              └─────────┬─────────┘
+                        │
+              Parse JSON response
+                        │
+         ┌──────────────┼──────────────┐
+         ▼              ▼              ▼
+       ALLOW          DENY         ESCALATE
+         │              │              │
+         └──────────────┴──────────────┘
+                        │
+              Persist to audit log
+              Fire webhooks (if ESCALATE)
+                        │
+              Return PermissionDecision
 ```
 
 ---
 
-## How It Works
+## Why This Exists
 
-```
-AI Agent  →  Permission Request  →  AgentAuth  →  Gemini Reasoning  →  ALLOW / DENY / ESCALATE
-                                        │
-                              Checks natural language
-                              policies assigned to
-                              the agent
-```
+Existing IAM tools (AWS IAM, Auth0, Keycloak) were built for human users. They model permissions as static role memberships and boolean flags.
 
-Unlike traditional access control (role-based, attribute-based), AgentAuth uses **Gemini to reason** over policies in natural language. This means:
+AI agents need something different:
+- **Context-dependent rules** — "only trade during market hours" is not a boolean
+- **Natural language policies** — written by product and compliance teams, not engineers
+- **Explainability** — agents need to know *why* a request was denied, not just that it was
+- **Offline operation** — regulated environments cannot send every decision to a cloud API
 
-- Policies can express nuanced, context-dependent rules
-- No need to enumerate every possible case upfront
-- Gemini explains *why* a decision was made
-- Edge cases that a rules engine would miss are caught
+AgentAuth addresses all four. It's the security layer you'd have to build yourself otherwise.
+
+---
+
+## Features
+
+| Feature | Status |
+|---|---|
+| Natural language policy evaluation (Gemini) | ✅ |
+| Offline evaluation (Gemma via HuggingFace) | ✅ |
+| Multi-tenant org isolation | ✅ |
+| SHA-256 hashed API key auth | ✅ |
+| JWT agent identity tokens | ✅ |
+| Full audit log with decision trail | ✅ |
+| HMAC-signed webhook delivery + retry backoff | ✅ |
+| Regulatory compliance templates (NBE Ethiopia, CBN Nigeria) | ✅ 12 templates, 179 rules |
+| Python SDK | ✅ |
+| Java SDK (MockWebServer, 27 tests) | ✅ |
+| Alembic migration chain | ✅ |
+| Deployed on Fly.io | ✅ |
 
 ---
 
@@ -74,141 +156,98 @@ Unlike traditional access control (role-based, attribute-based), AgentAuth uses 
 pip install agentauth
 ```
 
-### 2. Get a Gemini API key
-
-Sign up at [ai.google.dev](https://ai.google.dev) — free tier available.
-
-### 3. Configure
+### 2. Start the server
 
 ```bash
 cp .env.example .env
-# Add your GEMINI_API_KEY to .env
+# Add GEMINI_API_KEY and DATABASE_URL to .env
+agentauth-server
 ```
 
-### 4. Start the server
+To use Gemma instead (fully offline, no API key needed):
 
 ```bash
-agentauth-server
-# or
-uvicorn agentauth.api.server:app --reload
+REASONING_BACKEND=gemma GEMMA_MODEL_ID=google/gemma-2-2b-it agentauth-server
 ```
 
-### 5. Integrate
+### 3. Create an org and get an API key
 
 ```python
 from agentauth.sdk.client import AgentAuthClient
 
 client = AgentAuthClient(base_url="http://localhost:8000")
 
-# Create a policy
-policy = client.policies.create(
-    name="safe-policy",
-    rules=["Agent may only read data, never write or delete"]
-)
+org = client.orgs.create(name="my-company", slug="my-company", owner_id="user_1")
+key = client.orgs.issue_api_key(org_id=str(org.id), name="production")
 
-# Register an agent
-agent = client.agents.register(
-    name="my-ai-agent",
-    owner_id="your-user-id",
-    policy_ids=[str(policy.id)],
-)
+# Use key.plaintext_key as your X-API-Key header going forward
+client = AgentAuthClient(base_url="http://localhost:8000", api_key=key.plaintext_key)
+```
 
-# Check before acting
-decision = client.permissions.evaluate(
-    agent_id=str(agent.id),
-    action="delete_record",
-    resource="user_database",
-    context={"record_id": 42}
-)
+### 4. Use a compliance template (optional)
 
-print(decision.result)    # DENY
-print(decision.reason)    # "Agent is not authorized to delete records per policy"
-print(decision.confidence) # HIGH
+```python
+# Apply 179 pre-built NBE / CBN regulatory rules in one line
+policy = client.policies.create_from_template(
+    template_name="nbe_payment_agent",
+    policy_name="NBE Payment Rules",
+)
 ```
 
 ---
 
-## Use Cases
+## Python SDK
 
-### Fintech — Trading Agents
-Prevent trading bots from executing unauthorized trades, operating outside market hours, or exceeding position limits.
+```python
+from agentauth.sdk.client import AgentAuthClient
 
-### Healthtech — Clinical Assistants
-Ensure AI assistants only access patient data they're authorized to see and cannot prescribe without physician approval.
+client = AgentAuthClient(base_url="http://localhost:8000", api_key="your-key")
 
-### Enterprise Automation — Workflow Agents
-Control what automated agents can access, modify, or delete in production systems.
+# Policies
+policy = client.policies.create(name="my-policy", rules=["Agent may only read data"])
+policies = client.policies.list()
 
-### Developer Platforms
-Provide developers building AI products a drop-in security layer so they don't have to build identity from scratch.
+# Agents
+agent = client.agents.register(name="reader-bot", owner_id="u1", policy_ids=[str(policy.id)])
+token = client.agents.issue_token(agent_id=str(agent.id))
+
+# Permissions
+decision = client.permissions.evaluate(
+    agent_id=str(agent.id), action="delete_record", resource="users", context={"id": 42}
+)
+# decision.result → DENY
+# decision.reason → "Agent is not authorized to delete records per policy rule 1."
+
+# Audit
+history = client.audit.list(agent_id=str(agent.id))
+```
 
 ---
 
-## API Reference
+## Java SDK
 
-### Organisations
+```java
+AgentAuthClient client = new AgentAuthClient("http://localhost:8000", "your-api-key");
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `POST` | `/orgs` | Create a new organisation |
-| `GET` | `/orgs/{id}` | Get organisation details |
-| `POST` | `/orgs/{id}/api-keys` | Issue an API key for an org |
-| `GET` | `/orgs/{id}/api-keys` | List API keys for an org |
+// Register agent
+AgentResponse agent = client.registerAgent("my-agent", "user_1", List.of(policyId));
 
-### Policies
+// Evaluate
+PermissionDecision decision = client.evaluatePermission(
+    agent.getId(), "execute_trade", "binance", Map.of("amount", 500)
+);
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `POST` | `/policies` | Create a policy with natural language rules |
-| `GET` | `/policies` | List all policies (org-scoped) |
-| `GET` | `/policies/{id}` | Get a policy by ID |
-| `POST` | `/policies/from-template` | Create a policy from an NBE/CBN template |
+System.out.println(decision.getResult());    // ALLOW
+System.out.println(decision.getReason());
+```
 
-### Templates
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `GET` | `/templates` | List all available policy templates |
-| `GET` | `/templates/{name}` | Get a specific template by name |
-
-### Agents
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `POST` | `/agents` | Register an AI agent |
-| `GET` | `/agents?owner_id=` | List agents by owner |
-| `GET` | `/agents/{id}` | Get an agent by ID |
-| `POST` | `/agents/{id}/deactivate` | Deactivate an agent |
-| `POST` | `/agents/{id}/token` | Issue a signed JWT for an agent |
-
-### Permissions
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `POST` | `/agents/{id}/evaluate` | Evaluate a permission request |
-
-### Audit Log
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `GET` | `/agents/{id}/audit` | Query decision history for an agent |
-
-### Webhooks
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `POST` | `/agents/{id}/webhooks` | Register a webhook for an agent |
-| `GET` | `/agents/{id}/webhooks` | List webhooks for an agent |
-| `DELETE` | `/webhooks/{id}` | Delete a webhook |
-| `GET` | `/webhooks/{id}/deliveries` | Inspect delivery history |
-
-All endpoints except `/health`, `/templates`, and `/orgs` (POST) require an `X-API-Key` header for org authentication.
+See [sdk-java/README.md](sdk-java/README.md) for the full Java reference.
 
 ---
 
 ## Permission Decision
 
-Every evaluation returns a `PermissionDecision`:
+Every evaluation returns:
 
 ```json
 {
@@ -216,28 +255,93 @@ Every evaluation returns a `PermissionDecision`:
   "agent_id": "uuid",
   "permission": {
     "action": "execute_trade",
-    "resource": "binance_spot",
+    "resource": "BTCUSDT",
     "context": { "amount": 15000 }
   },
   "result": "DENY",
-  "reason": "Trade amount of $15,000 exceeds the maximum single trade limit of $10,000 per policy rule 2.",
+  "reason": "Trade amount of $15,000 exceeds the maximum single trade limit of $10,000 per rule 2.",
   "confidence": "HIGH",
   "matched_rules": [
     "Agent may not execute single trades above $10,000"
   ],
-  "evaluated_at": "2026-07-10T10:30:00Z",
+  "evaluated_at": "2026-11-23T10:00:00Z",
   "latency_ms": 342.5
 }
 ```
 
 ---
 
-## Running Tests
+## Compliance Templates
+
+AgentAuth ships 12 regulatory policy templates covering African financial regulations:
+
+| Template | Regulator | Rules |
+|---|---|---|
+| `nbe_payment_agent` | NBE Ethiopia | Payment processing limits, AML, KYC |
+| `nbe_lending_agent` | NBE Ethiopia | Credit scoring, loan disbursement controls |
+| `nbe_forex_agent` | NBE Ethiopia | Foreign currency trading restrictions |
+| `nbe_audit_agent` | NBE Ethiopia | Audit and reporting obligations |
+| `nbe_kyc_agent` | NBE Ethiopia | Customer identity verification |
+| `nbe_risk_agent` | NBE Ethiopia | Risk assessment and monitoring |
+| `nbe_data_agent` | NBE Ethiopia | Data residency and privacy |
+| `cbn_payment_agent` | CBN Nigeria | Payment authorization controls |
+| `cbn_lending_agent` | CBN Nigeria | Lending and credit restrictions |
+| `cbn_forex_agent` | CBN Nigeria | FX and remittance rules |
+| `cbn_kyc_agent` | CBN Nigeria | KYC and AML requirements |
+| `cbn_risk_agent` | CBN Nigeria | Risk and capital adequacy |
 
 ```bash
-pip install "agentauth[dev]"
-pytest tests/ -v
+GET /templates                    # list all
+GET /templates/nbe_payment_agent  # inspect rules
+POST /policies/from-template      # apply in one call
 ```
+
+---
+
+## API Reference
+
+### Organisations
+| Method | Endpoint | Auth |
+|---|---|---|
+| `POST` | `/orgs` | None |
+| `GET` | `/orgs/{id}` | API key |
+| `POST` | `/orgs/{id}/api-keys` | API key |
+| `GET` | `/orgs/{id}/api-keys` | API key |
+
+### Agents
+| Method | Endpoint |
+|---|---|
+| `POST` | `/agents` |
+| `GET` | `/agents?owner_id=` |
+| `GET` | `/agents/{id}` |
+| `POST` | `/agents/{id}/deactivate` |
+| `POST` | `/agents/{id}/token` |
+
+### Policies & Templates
+| Method | Endpoint |
+|---|---|
+| `POST` | `/policies` |
+| `GET` | `/policies` |
+| `GET` | `/policies/{id}` |
+| `POST` | `/policies/from-template` |
+| `GET` | `/templates` |
+| `GET` | `/templates/{name}` |
+
+### Permissions & Audit
+| Method | Endpoint |
+|---|---|
+| `POST` | `/agents/{id}/evaluate` |
+| `GET` | `/agents/{id}/audit` |
+
+### Webhooks
+| Method | Endpoint |
+|---|---|
+| `POST` | `/agents/{id}/webhooks` |
+| `GET` | `/agents/{id}/webhooks` |
+| `DELETE` | `/webhooks/{id}` |
+| `GET` | `/webhooks/{id}/deliveries` |
+
+All endpoints except `/health`, `/templates` (GET), and `/orgs` (POST) require `X-API-Key`.
 
 ---
 
@@ -247,62 +351,71 @@ pytest tests/ -v
 agentauth/
 ├── agentauth/
 │   ├── core/
-│   │   ├── engine.py      # Gemini permission reasoning engine
-│   │   └── models.py      # Agent, Policy, Permission, PermissionDecision, Webhook, Organization
+│   │   ├── base_engine.py    # Abstract BaseEngine — Gemini and Gemma share this interface
+│   │   ├── engine.py         # Gemini backend
+│   │   ├── gemma_engine.py   # Gemma backend (local, offline)
+│   │   └── models.py         # Domain models: Agent, Policy, Permission, PermissionDecision
 │   ├── api/
-│   │   ├── server.py      # FastAPI REST server (v0.5.0)
-│   │   ├── auth.py        # JWT agent identity tokens
-│   │   └── tenancy.py     # Multi-tenant API key auth
+│   │   ├── server.py         # FastAPI app — all routes, v0.8.0
+│   │   ├── auth.py           # JWT agent identity tokens
+│   │   └── tenancy.py        # Multi-tenant API key authentication
 │   ├── db/
-│   │   ├── models.py      # SQLAlchemy ORM models
-│   │   ├── session.py     # Async DB session + engine setup
-│   │   └── stores.py      # DB-backed stores (agents, policies, webhooks, audit, orgs)
+│   │   ├── models.py         # SQLAlchemy ORM models
+│   │   ├── session.py        # Async DB session factory
+│   │   └── stores.py         # Data access layer
 │   ├── sdk/
-│   │   └── client.py      # Python SDK client
+│   │   └── client.py         # Python SDK
 │   ├── templates/
-│   │   ├── registry.py    # Template registry + PolicyTemplate enum
-│   │   ├── nbe.py         # NBE Ethiopia templates (7 templates)
-│   │   └── cbn.py         # CBN Nigeria templates (5 templates)
+│   │   ├── registry.py       # Template registry
+│   │   ├── nbe.py            # NBE Ethiopia: 7 templates, 100+ rules
+│   │   └── cbn.py            # CBN Nigeria: 5 templates, 79 rules
 │   └── webhooks/
-│       └── dispatcher.py  # Webhook delivery with retry + backoff
-├── alembic/
-│   └── versions/         # Database migrations
-├── tests/
-│   ├── test_models.py
-│   ├── test_store.py
-│   ├── test_api.py
-│   ├── test_auth.py
-│   ├── test_webhooks.py
-│   ├── test_templates.py
-│   ├── test_cbn_templates.py
-│   └── test_tenancy.py
+│       └── dispatcher.py     # HMAC-signed delivery with retry + exponential backoff
+├── sdk-java/                 # Java SDK (Maven, 27 tests with MockWebServer)
+├── alembic/versions/         # 3 migrations: initial → webhooks → multi-tenant
+├── tests/                    # 100+ tests across 8 test files
+├── .github/workflows/ci.yml  # CI: Python tests + Java SDK tests
 ├── .env.example
-├── pyproject.toml
-└── README.md
+└── pyproject.toml
+```
+
+---
+
+## Running Tests
+
+```bash
+# Python
+pip install -e ".[dev]"
+pytest tests/ -v
+
+# Java SDK
+cd sdk-java && mvn test
 ```
 
 ---
 
 ## Roadmap
 
-- [x] Persistent storage (PostgreSQL)
-- [x] JWT-based agent identity tokens
-- [x] Audit log with full decision trail
-- [x] Webhook notifications for ESCALATE decisions
-- [x] Policy templates for African regulatory contexts (NBE Ethiopia, CBN Nigeria)
-- [x] Multi-tenant support
-- [ ] Gemma support for on-device / offline evaluation
-- [ ] Java SDK
+- [x] Natural language policy evaluation (Gemini)
+- [x] Persistent storage (PostgreSQL + Alembic migrations)
+- [x] JWT agent identity tokens
+- [x] Full audit log
+- [x] HMAC-signed webhook delivery with retry backoff
+- [x] Regulatory compliance templates (NBE Ethiopia, CBN Nigeria — 12 templates, 179 rules)
+- [x] Multi-tenant org isolation
+- [x] Offline evaluation backend (Gemma via HuggingFace Transformers)
+- [x] Java SDK (27 tests, MockWebServer)
+- [ ] TypeScript / Node.js SDK
+- [ ] Rate limiting and quota enforcement per org
+- [ ] Dashboard UI
 
 ---
 
 ## Built in Africa
 
-AgentAuth is built by **Kalkidan Dagnu**, co-founder of [Kibrnet PLC](https://github.com/kibrnet) in Addis Ababa, Ethiopia.
+**Kalkidan Dagnu**, Senior Software Engineer, [Kibrnet PLC](https://github.com/kibrnet) — Addis Ababa, Ethiopia.
 
-This project is part of the broader movement of world-class developer infrastructure being built from Africa.
-
-The goal: give every African AI developer a secure, production-ready identity layer for their agents — so they can focus on building, not on reinventing security from scratch.
+The goal: give every African AI developer a secure, production-ready identity layer for their agents — so they can build products, not security infrastructure.
 
 ---
 
@@ -310,10 +423,6 @@ The goal: give every African AI developer a secure, production-ready identity la
 
 MIT — free to use, modify, and build on.
 
----
-
 ## Contributing
 
 Issues and PRs welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
-
-If you're building an AI product in Africa and want to be an early adopter or design partner, open an issue or reach out directly.
